@@ -549,6 +549,11 @@ void bind_texture(const RsxTexture& t, const uint8_t* data, uint32_t& dims) {
 GLuint vao = 0, vbo = 0, ibo = 0;
 constexpr size_t kRing = 64u << 20;
 size_t vbo_at = 0, ibo_at = 0;
+std::unordered_map<uint64_t, GLuint> arrays;           // kept vertex arrays, by the FIFO thread's key
+void forget_arrays() {
+    for (auto& [k, b] : arrays) glDeleteBuffers(1, &b);
+    arrays.clear();
+}
 std::map<std::vector<GLuint>, GLuint> fbos;            // the draw framebuffers, by their attachments
 void forget_fbos() {
     for (auto& [k, f] : fbos) glDeleteFramebuffers(1, &f);
@@ -644,6 +649,7 @@ void dump_draw(const RsxDraw& d, size_t nattrs, F attr, const std::vector<uint32
         const uint8_t* data;
         attr(i, idx, fmt, data);
         uint32_t type = fmt & 0xF, size = fmt >> 4 & 0xF, stride = fmt >> 8 & 0xFF;
+        if (!data) { rt_log("  in%u: kept from an earlier draw", idx); continue; }
         for (uint32_t v = 0; v < std::min(d.vertices, 6u); ++v) {
             std::string s;
             for (uint32_t c = 0; c < size; ++c) {
@@ -685,12 +691,20 @@ void draw(const uint8_t*& p) {
         p += 8;
         ranges.push_back({f, n});
     }
-    struct Attr { uint32_t index, format, bytes; const uint8_t* data; };
+    struct Attr { uint32_t index, format, bytes; uint64_t key; const uint8_t* data; };
     std::vector<Attr> attrs(d.attrs);
     for (auto& a : attrs) {
+        uint32_t sent;
+        uint64_t forget;
         std::memcpy(&a.index, p, 4); std::memcpy(&a.format, p + 4, 4); std::memcpy(&a.bytes, p + 8, 4);
-        a.data = p + 12;
-        p += 12 + a.bytes;
+        std::memcpy(&a.key, p + 12, 8); std::memcpy(&forget, p + 20, 8); std::memcpy(&sent, p + 28, 4);
+        p += 32;
+        if (forget) {
+            auto it = arrays.find(forget);
+            if (it != arrays.end()) { glDeleteBuffers(1, &it->second); arrays.erase(it); }
+        }
+        a.data = sent ? p : nullptr;                                // null: kept from an earlier draw
+        if (sent) p += a.bytes;
     }
     const uint32_t* fp = reinterpret_cast<const uint32_t*>(p);
     std::vector<uint32_t> fpw(d.fp_words);
@@ -779,8 +793,19 @@ void draw(const uint8_t*& p) {
         case 6: report_once("CMP vertex attributes"); continue;
         default: gt = GL_FLOAT; break;
         }
-        size_t o = ring(vbo, vbo_at, a.data, a.bytes);
-        glVertexArrayVertexBuffer(vao, a.index, vbo, (GLintptr)o, (GLsizei)stride);
+        if (a.key) {
+            GLuint& b = arrays[a.key];
+            if (a.data) {
+                if (b) glDeleteBuffers(1, &b);
+                glCreateBuffers(1, &b);
+                glNamedBufferStorage(b, a.bytes, a.data, 0);
+            }
+            if (!b) { report_once("a kept vertex array the renderer does not have"); continue; }
+            glVertexArrayVertexBuffer(vao, a.index, b, 0, (GLsizei)stride);
+        } else {
+            size_t o = ring(vbo, vbo_at, a.data, a.bytes);
+            glVertexArrayVertexBuffer(vao, a.index, vbo, (GLintptr)o, (GLsizei)stride);
+        }
         // a stride of 0 is one element for every vertex, where GL would read the
         // elements packed: as a per-instance attribute, every vertex reads element 0
         glVertexArrayBindingDivisor(vao, a.index, stride ? 0 : 1);
@@ -874,6 +899,7 @@ void rsxgl_exec(const uint8_t* rec, size_t n, void (*on_flip)(const RsxFlip&)) {
             for (auto& [k, t] : textures) if (t.tex) glDeleteTextures(1, &t.tex);
             textures.clear();
             break;
+        case RC_VTXFLUSH: forget_arrays(); break;
         default: rt_log("rsxgl: bad record byte %02X", op); return;
         }
     }

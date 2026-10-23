@@ -31,6 +31,22 @@ std::unordered_map<uint64_t, KnownTexture> g_known;
 struct Target { uint32_t w, h, depth_format; };
 std::unordered_map<uint64_t, Target> g_colors, g_depths;
 uint64_t g_sent_bytes = 0;
+// A vertex array (an attribute's bytes for one draw's vertices) by its
+// address, length and format, watched while its memory goes unwritten, as a
+// texture is. Found unwritten by a draw of a later frame, it gets a key,
+// which then stands for its data: the renderer keeps it in a buffer of its
+// own. Until then, and once written again, it is sent with every draw (and
+// its key, if it had one, is forgotten at once), so that an array the game
+// rewrites makes no buffers: one written once a frame and drawn twice (a
+// shadow pass and the scene) would otherwise make and drop a buffer every
+// frame, which stalls the driver. One found written three times running is
+// taken to be rewritten every frame and is no longer watched (every write
+// would cost a fault), but tried again every 256th time.
+struct KnownArray { uint32_t addr, bytes, format; uint64_t key, stamp; uint32_t dirty, frame; };
+std::unordered_map<uint64_t, KnownArray> g_arrays;
+std::unordered_set<uint64_t> g_vsent;   // array keys the renderer has
+uint64_t g_vsent_bytes = 0, g_next_key = 0;
+uint32_t g_frame = 0;                   // flips captured
 uint64_t g_draws = 0;
 std::set<std::string> g_reported;
 
@@ -108,6 +124,17 @@ uint32_t component_bytes(uint32_t type) {
     }
 }
 
+// A vertex array's bytes from guest memory, each component in host order.
+void read_array(std::vector<uint8_t>& out, uint32_t a, uint32_t bytes, uint32_t fmt, uint32_t vertices) {
+    uint32_t size = fmt >> 4 & 0xF, type = fmt & 0xF, stride = fmt >> 8 & 0xFF;
+    uint32_t cb = component_bytes(type), elem = type == 6 ? 4 : size * cb;
+    out.assign(g_mem + a, g_mem + a + bytes);
+    if (cb == 1 && type != 6) return;
+    uint32_t step = stride ? stride : elem, nv = stride ? vertices : 1, swap = type == 6 ? 4 : cb;
+    for (uint32_t v = 0; v < nv; ++v)
+        for (uint32_t c = 0; c < elem; c += swap) std::reverse(&out[v * step + c], &out[v * step + c + swap]);
+}
+
 void end_draw() {
     if (g_ranges.empty()) return;
     ProfScope prof(PROF_FIFO_CAPTURE);
@@ -145,24 +172,36 @@ void end_draw() {
     d.count = g_indexed ? (uint32_t)indices.size() : (uint32_t)g_ranges.size();
 
     // the attributes
-    struct Attr { uint32_t index, format, bytes; std::vector<uint8_t> data; };
+    struct Attr { uint32_t index, format, bytes, addr; uint64_t key, forget; bool send; std::vector<uint8_t> data; };
     std::vector<Attr> attrs;
     for (uint32_t i = 0; i < 16 && d.vertices; ++i) {
         uint32_t fmt = R(0x1740 + 4 * i), size = fmt >> 4 & 0xF, type = fmt & 0xF, stride = fmt >> 8 & 0xFF;
         if (!size) continue;
         uint32_t off = R(0x1680 + 4 * i);
         uint32_t a = address(off >> 31, (off & 0x7FFFFFFF) + R(0x1738)) + stride * d.base;
-        uint32_t cb = component_bytes(type), elem = type == 6 ? 4 : size * cb;
+        uint32_t elem = type == 6 ? 4 : size * component_bytes(type);
         uint32_t bytes = stride ? (d.vertices - 1) * stride + elem : elem;
         if (!readable(a, bytes)) { report_once("vertex attribute outside guest memory"); continue; }
-        Attr at{i, fmt, bytes, std::vector<uint8_t>(bytes)};
-        std::memcpy(at.data.data(), g_mem + a, bytes);
-        uint32_t step = stride ? stride : elem, nv = stride ? d.vertices : 1;
-        if (cb > 1 || type == 6) {
-            uint32_t swap = type == 6 ? 4 : cb;
-            for (uint32_t v = 0; v < nv; ++v)
-                for (uint32_t c = 0; c < elem; c += swap) std::reverse(&at.data[v * step + c], &at.data[v * step + c + swap]);
+        Attr at{i, fmt, bytes, a, 0, 0, true, {}};
+        uint32_t id[3] = {a, bytes, fmt};
+        KnownArray& ka = g_arrays[hash((const uint8_t*)id, sizeof id, 0)];
+        bool same = ka.addr == a && ka.bytes == bytes && ka.format == fmt;
+        bool clean = same && ka.stamp && memwatch_clean(a, bytes, ka.stamp);
+        if (clean && (ka.key || ka.frame != g_frame)) {
+            if (!ka.key) ka.key = ++g_next_key;
+            at.key = ka.key;
+            ka.dirty = 0;
+        } else if (!clean) {
+            at.forget = ka.key;
+            if (ka.key && g_vsent.erase(ka.key)) g_vsent_bytes -= ka.bytes;
+            if (!same) ka = KnownArray{a, bytes, fmt, 0, 0, 0, 0};
+            else ++ka.dirty;
+            ka.key = 0;
+            ka.stamp = ka.dirty < 3 || ka.dirty % 256 == 0 ? memwatch_arm(a, bytes) : 0;   // before the read
+            ka.frame = g_frame;
         }
+        at.send = !at.key || !g_vsent.count(at.key);
+        if (at.send) read_array(at.data, a, bytes, fmt, d.vertices);
         attrs.push_back(std::move(at));
     }
     d.attrs = (uint32_t)attrs.size();
@@ -252,13 +291,31 @@ void end_draw() {
         g_sent.clear();
         g_sent_bytes = 0;
     }
+    // and so do its kept vertex arrays, past theirs
+    uint64_t vfresh = 0;
+    for (auto& at : attrs) if (at.key && at.send) vfresh += at.bytes;
+    if (vfresh && g_vsent_bytes + vfresh > (256ull << 20)) {
+        g_rec.push_back(RC_VTXFLUSH);
+        g_vsent.clear();
+        g_vsent_bytes = 0;
+        for (auto& at : attrs)
+            if (at.key && !at.send) {                               // the renderer no longer has it: read it again
+                at.send = true;
+                read_array(at.data, at.addr, at.bytes, at.format, d.vertices);
+            }
+    }
+    for (auto& at : attrs)
+        if (at.key && at.send && g_vsent.insert(at.key).second) g_vsent_bytes += at.bytes;
 
     flush_regs();
     g_rec.push_back(RC_DRAW);
     put(d);
     if (g_indexed) put_bytes(indices.data(), indices.size() * 4);
     else for (auto& [f, n] : g_ranges) { put(f - lo); put(n); }
-    for (auto& at : attrs) { put(at.index); put(at.format); put(at.bytes); put_bytes(at.data.data(), at.bytes); }
+    for (auto& at : attrs) {
+        put(at.index); put(at.format); put(at.bytes); put(at.key); put(at.forget); put((uint32_t)at.send);
+        if (at.send) put_bytes(at.data.data(), at.bytes);
+    }
     put_bytes(fp.data(), fp.size() * 4);
     for (auto& [t0, a] : texs) {
         RsxTexture t = t0;
@@ -324,6 +381,7 @@ void rsxcap_method(uint32_t m, uint32_t v) {
 
 void rsxcap_flip(const RsxFlip& f) {
     flush_regs();
+    ++g_frame;
     g_rec.push_back(RC_FLIP);
     put(f);
     video_submit(g_rec, 1);

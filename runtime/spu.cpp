@@ -382,9 +382,24 @@ static const SPUProgram* overlay_at(const SPUContext& s, uint32_t pc) {
     }
     if (near) {
         static std::atomic<bool> told{false};
-        if (!told.exchange(true))
+        if (!told.exchange(true)) {
             rt_log("spu %u: branch to %05X, inside %s as recompiled at %05X, but local store holds other code there",
                    s.id, pc, near->name, near->base);
+            // whose code it is: the 32 bytes at the target, looked for in every
+            // module's image, give the module and the base it was copied to,
+            // so that its bias can go on the recompiler's command line
+            for (size_t i = 0; i < g_spu_noverlays; ++i) {
+                const SPUProgram& o = g_spu_overlays[i];
+                bool seen = false;
+                for (size_t k = 0; k < i && !seen; ++k) seen = g_spu_overlays[k].ea == o.ea;
+                if (seen || o.size < 32) continue;
+                for (uint32_t off = 0; off + 32 <= o.size; off += 4)
+                    if (std::memcmp(s.ls + (pc & 0x3FFFC), g_mem + o.ea + off, 32) == 0)
+                        rt_log("spu %u: local store holds %s there, copied to %05X: its bias is %X more than the one it "
+                               "was recompiled at (%05X)", s.id, o.name, (pc & 0x3FFFC) - off,
+                               ((pc & 0x3FFFC) - off) - o.base, o.base);
+            }
+        }
     }
     return nullptr;
 }

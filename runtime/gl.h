@@ -54,6 +54,7 @@
     X(PFNGLPROGRAMUNIFORM1FPROC, glProgramUniform1f)                                                \
     X(PFNGLPROGRAMUNIFORM1UIPROC, glProgramUniform1ui)                                              \
     X(PFNGLCREATEBUFFERSPROC, glCreateBuffers)                                                      \
+    X(PFNGLDELETEBUFFERSPROC, glDeleteBuffers)                                                      \
     X(PFNGLNAMEDBUFFERSTORAGEPROC, glNamedBufferStorage)                                            \
     X(PFNGLNAMEDBUFFERSUBDATAPROC, glNamedBufferSubData)                                            \
     X(PFNGLINVALIDATEBUFFERDATAPROC, glInvalidateBufferData)                                        \

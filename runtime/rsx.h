@@ -16,12 +16,18 @@
 //   FLIP     RsxFlip
 //   TEXFLUSH the renderer's textures are forgotten (the FIFO thread's list of
 //            what it has sent was full and starts again)
+//   VTXFLUSH the renderer's kept vertex arrays are forgotten, likewise
 //
 // A DRAW's sections, in order:
 //   arrays:  ranges x {u32 first, u32 count}, first counted from base
 //   indexed: indices x u32, rebased to base; the restart index is 0xFFFFFFFF
-//   attributes: attrs x {u32 index, u32 format, u32 bytes, data}, host order,
-//            at the array's stride, starting at vertex base
+//   attributes: attrs x {u32 index, u32 format, u32 bytes, u64 key, u64
+//            forget, u32 sent, data if sent}, host order, at the array's
+//            stride, starting at vertex base. A key names an array whose
+//            memory has not been written since it was read (0: none, the
+//            data is always sent); the renderer keeps it, and the data comes
+//            once per key. forget: a key whose array has been written since,
+//            whose copy the renderer can let go (0: none).
 //   fragment program: fp_words x u32, decoded (fp_word)
 //   textures: textures x {RsxTexture, data of RsxTexture::bytes bytes}
 #pragma once
@@ -29,7 +35,7 @@
 #include <string>
 #include <vector>
 
-enum : uint8_t { RC_REGS = 1, RC_DRAW, RC_FLIP, RC_TEXFLUSH };
+enum : uint8_t { RC_REGS = 1, RC_DRAW, RC_FLIP, RC_TEXFLUSH, RC_VTXFLUSH };
 
 struct RsxDraw {
     uint32_t prim;                      // NV4097_SET_BEGIN_END

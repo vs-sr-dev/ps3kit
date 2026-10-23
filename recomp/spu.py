@@ -383,12 +383,44 @@ _LINKING = {"brsl", "brasl", "bisl", "bisled"}
 _GOTO = re.compile(r"goto L_([0-9A-F]{5});")
 
 
+def _relative_table(img, prog, off, reg):
+    """The targets of a switch whose table holds offsets from the table itself
+    (position-independent code, Edge zlib's inflate): before the `bi $r` at
+    `off`, `ila $t, TABLE` (perhaps rebased, `a $t, $t, $126`), a bound
+    `clgti $c, $i, N`, and `a $r, $entry, $t`; the N + 1 words at TABLE,
+    each added to TABLE. Nothing when the pattern is not there."""
+    table = bound = None
+    base_reg = None
+    for k in range(4, 4 * 32, 4):
+        if off - k < 0:
+            break
+        ins = decode(img.u32(prog.ea + off - k))
+        op, f = ins.op, ins.f
+        if base_reg is None and op == "a" and f["rt"] == reg:
+            base_reg = f["rb"]
+        elif op == "a" and base_reg is not None and f["rt"] == base_reg and f["rb"] == 126:
+            base_reg = f["ra"]                     # the table, rebased
+        elif op == "clgti" and bound is None:
+            bound = f["i10"]
+        elif op == "ila" and base_reg is not None and f["rt"] == base_reg:
+            table = f["i18"]
+            break
+    if table is None or bound is None or not 0 <= bound < 1024:
+        return []
+    at = table - prog.base
+    if not 0 <= at <= prog.size - 4 * (bound + 1):
+        return []
+    return [(table + img.u32(prog.ea + at + 4 * i)) & 0xFFFFFFFF for i in range(bound + 1)]
+
+
 def dispatch_targets(img, prog):
     """The addresses an indirect branch of an SPU ELF's program can reach, as
     offsets into it: its entry, every return address (after a branch that
     links), and every code address the program holds as a constant, in an
     immediate load (`ila`, `il`, `ilhu` with `iohl`) or as a word of any of
-    the ELF's loaded segments (jump tables, function pointers). A job
+    the ELF's loaded segments (jump tables, function pointers); the targets of
+    a jump computed from a return address, and of a switch whose table holds
+    offsets from itself (`_relative_table`). A job
     relocates itself and computes its addresses, so a job keeps every
     instruction as a target (None), and so does a module, whose loader may
     rewrite the addresses it holds."""
@@ -407,6 +439,15 @@ def dispatch_targets(img, prog):
         op, f = ins.op, ins.f
         if op in _LINKING:
             add(lo + off + 4)
+            # a jump computed from the return address: `brsl $2, next;
+            # ai $2, $2, 8; bi $2` (a branch over the next words)
+            for k in range(4, 16, 4):
+                if off + k >= n:
+                    break
+                nxt = decode(img.u32(prog.ea + off + k))
+                if nxt.op == "ai" and nxt.f["rt"] == f["rt"] and nxt.f["ra"] == f["rt"]:
+                    add(lo + off + 4 + nxt.f["i10"])
+                    break
         elif op == "ila":
             add(f["i18"])
         elif op == "il":
@@ -415,6 +456,9 @@ def dispatch_targets(img, prog):
             hi_part[f["rt"]] = f["i16"] << 16
         elif op == "iohl" and f["rt"] in hi_part:
             add(hi_part.pop(f["rt"]) | f["i16"])
+        elif op == "bi":
+            for a in _relative_table(img, prog, off, f["ra"]):
+                add(a)
     phoff, phnum = img.u32(prog.elf + 28), img.u32(prog.elf + 44) >> 16
     for i in range(phnum):
         ph = prog.elf + phoff + 32 * i

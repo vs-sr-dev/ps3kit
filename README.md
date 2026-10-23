@@ -21,7 +21,7 @@ submodule at `ps3kit/`.
 | Port | Game | What it asked of ps3kit |
 |---|---|---|
 | [pc-ragnarokodysseyace](https://github.com/vs-sr-dev/pc-ragnarokodysseyace) | Ragnarok Odyssey ACE (2013) | everything so far: the descriptor table, the imports, the PPU recompiler, the process start, threads, files, the command buffer to its first flip, the audio ports and their clock, the window, the RSX's draws: the publishers' logos; save data; cellSail and an MPEG-2 decoder: the first movie; the controller: the title screen, the main menu and character creation; the SPU recompiler and a job manager: CRI's sound, heard; cellFont with an OpenType/CFF reader and a rasterizer of its own: character creation's text; system events and the on-screen keyboard: the hero's name |
-| [pc-3ddotgameheroes](https://github.com/vs-sr-dev/pc-3ddotgameheroes) | 3D Dot Game Heroes (2009) | the SPUs: SPU ELFs recompiled at their load address, lv2 SPU thread groups (FMOD's mixer), SPURS task sets, tasks and event flags on a kernel of the runtime's own, `spu_printf`; switch tables the compiler did not optimise; the I/O map, reports and inline image transfers (the fragment programs); audio notifications; `/dev_flash` and `/dev_hdd1`: the publishers' and the middleware's logos; trophies, read from the disc's set and kept; SPU modules recompiled where their loader puts them (FMOD's codec): the title screen, its demo play and FMOD's music |
+| [pc-3ddotgameheroes](https://github.com/vs-sr-dev/pc-3ddotgameheroes) | 3D Dot Game Heroes (2009) | the SPUs: SPU ELFs recompiled at their load address, lv2 SPU thread groups (FMOD's mixer), SPURS task sets, tasks and event flags on a kernel of the runtime's own, `spu_printf`; switch tables the compiler did not optimise; the I/O map, reports and inline image transfers (the fragment programs); audio notifications; `/dev_flash` and `/dev_hdd1`: the publishers' and the middleware's logos; trophies, read from the disc's set and kept; SPU modules recompiled where their loader puts them (FMOD's codec): the title screen, its demo play and FMOD's music; SPURS lock-free queues and queues (Edge zlib, Bullet), position-independent SPU code's jumps, vertex arrays kept while unwritten: the first field, played at 30 frames |
 
 ## Using it
 
@@ -160,7 +160,7 @@ position-independent and relocate themselves.
 | 1. Recognise | What is in this executable? | `elf`: segments, process parameters, TLS, the descriptor table, imports by name; SPURS job binaries by their job-runtime header; SPU ELFs by their header and `.note.spu_name` (`recomp.spu.find_elfs`) | task sets, the middleware it links |
 | 2. Read code | What does this function do? | `ppu`: the PPU decoder, disassembly, census; `spu`: the same for the SPU | cross-references through the TOC |
 | 3. Recompile | The code as C++ | `recomp`: discovery, switch tables, the whole user-mode PPU set and the VMX operations games use; each SPU program whole, every SPU instruction but `bisled` and the double compares by magnitude: SPURS jobs, and SPU ELFs at their load address, dispatching only where an indirect branch can land; SPU modules another SPU program loads (FMOD's codecs and effects), at the bias a run shows (`--spu-module-bias`) | |
-| 4. Run | The PS3 under the game | `runtime`: memory map, dispatch, loader, imports, lv2 calls, the process start; PPU threads, lightweight and lv2 synchronisation, event queues; the file system (cellFs and sys_fs); cellGame; cellGcmSys and cellResc with a FIFO consumer, labels, reports, the I/O map, flips and a 59.94 Hz vblank; the renderer (SDL3, OpenGL 4.5): a window, render targets on the host GPU, clears, draws with vertex and fragment programs translated to GLSL, textures, blending, flips; video out; cellAudio and the audio output, with the 48 kHz clock that consumes the ports and plays them through SDL3; SPURS job queues with a job manager running recompiled SPU programs: the SPU's channels, its DMA and atomic unit, the lock-line reservation event; lv2 SPU images and thread groups, the threads' mailboxes, event ports and local stores; SPURS instances, task sets, tasks, exit codes and event flags, on a kernel of the runtime's own; save data (Auto, ListAuto, Fixed) with PARAM.SFO; trophies (sceNpTrophy) from the disc's TROPHY.TRP, the unlocks kept on `/dev_hdd0`; SPU modules run as overlays when their loader branches into them; cellSail playing PAMF through the runtime's own MPEG-2 decoder; cellPad from the host's gamepad and keyboard; system events raised through cellSysutilCheckCallback; cellOskDialog typed on the host's keyboard; cellFont over the runtime's own OpenType reader (CFF outlines, name- or CID-keyed) and coverage rasterizer | the rest of the 3D engine's state (fog, clip planes, two-sided colour, point sprites), TrueType outlines and the system's font sets, the list save dialogs, SPURS queues, lock-free queues and barriers |
+| 4. Run | The PS3 under the game | `runtime`: memory map, dispatch, loader, imports, lv2 calls, the process start; PPU threads, lightweight and lv2 synchronisation, event queues; the file system (cellFs and sys_fs); cellGame; cellGcmSys and cellResc with a FIFO consumer, labels, reports, the I/O map, flips and a 59.94 Hz vblank; the renderer (SDL3, OpenGL 4.5): a window, render targets on the host GPU, clears, draws with vertex and fragment programs translated to GLSL, textures, blending, flips; video out; cellAudio and the audio output, with the 48 kHz clock that consumes the ports and plays them through SDL3; SPURS job queues with a job manager running recompiled SPU programs: the SPU's channels, its DMA and atomic unit, the lock-line reservation event; lv2 SPU images and thread groups, the threads' mailboxes, event ports and local stores; SPURS instances, task sets, tasks, exit codes, event flags and the PPU's side of lock-free queues, on a kernel of the runtime's own; save data (Auto, ListAuto, Fixed) with PARAM.SFO; trophies (sceNpTrophy) from the disc's TROPHY.TRP, the unlocks kept on `/dev_hdd0`; SPU modules run as overlays when their loader branches into them; cellSail playing PAMF through the runtime's own MPEG-2 decoder; cellPad from the host's gamepad and keyboard; system events raised through cellSysutilCheckCallback; cellOskDialog typed on the host's keyboard; cellFont over the runtime's own OpenType reader (CFF outlines, name- or CID-keyed) and coverage rasterizer | the rest of the 3D engine's state (fog, clip planes, two-sided colour, point sprites), TrueType outlines and the system's font sets, the list save dialogs, SPURS queues and barriers, the SPU's side of lock-free queues |
 
 ## Known approximations
 
@@ -207,6 +207,17 @@ Declared here as they are made, so that the list is the cost:
   the GPU drew is not there. Hashing the 1280x1280 shadow map's depth buffer
   from memory on every draw that sampled it had held character creation to
   9 frames a second.
+- A draw's vertex arrays are watched the same way, by address, length and
+  format. One found unwritten by a later draw gets a key, and the renderer
+  draws it from a buffer of its own, until 256 MB of them have been sent;
+  until then, and as soon as it is written again, it is sent with every draw
+  and its buffer let go, so that arrays the game rewrites make no buffers
+  (thousands of short-lived ones had slowed the driver down, by up to half a
+  frame rate). An array found written three times running is taken to be
+  rewritten every frame and is copied every time without being watched (each
+  write would fault), tried again every 256th time. Copying every array of every draw
+  had held 3D Dot Game Heroes' first field to 8 frames a second (110 MB a
+  frame of voxel triangle lists).
 - A D24S8 depth surface sampled as A8R8G8B8 is converted on the GPU to the
   bytes the RSX would read (depth from the top in A, R and G, the stencil in
   B), again only when the surface has been written since. Any other format
@@ -349,23 +360,33 @@ Declared here as they are made, so that the list is the cost:
   (`--spu-module-bias`): every module at every bias, every instruction a
   possible target. A branch out of a program runs the overlay whose image
   local store holds at that address, compared whole on every entry; a module
-  copied anywhere else is reported once and ends the program, as before.
+  copied anywhere else is reported once and ends the program, as before, and
+  the report names the module local store holds there and the base it was
+  copied to (its bytes at the target, looked for in every module's image), so
+  that its bias can go on the recompiler's command line.
   The `.fixup` words a loader patches are data, and are not compared.
 - SPURS has a kernel of the runtime's own that does not schedule: every task
   runs on a host thread of its own from its creation, whatever the number of
   SPUs the instance was given. The taskset policy module's context and the
   kernel's are written where a task's library reads them, with the layouts
   RPCS3 documents. A task waiting for a signal polls its taskset's
-  `signalled` bit every 50 microseconds; a task's context is never saved, so
+  `signalled` bit every 50 microseconds, and a task that waits or yields in
+  a taskset that has been shut down ends there, without an exit code, as the
+  system would never resume it; a task's context is never saved, so
   the save areas and LS patterns are only checked by the task itself. The
   workload flag syscall is reported and answers 0. An event a task sends goes
   to the queue attached to that SPU port of its instance; `spu_printf` (port
   1, when no queue is attached) is printed by the runtime.
   `_cellSpursTaskAttributeInitialize`'s signature, (attr, revision, sdk, elf,
   saveConfig*, argument*), is read off a call site.
-- SPURS queues, lock-free queues and barriers answer `CELL_OK` and do
-  nothing: their layouts are what the tasks' own code reads, and are not read
-  yet.
+- SPURS lock-free queues are pushed by the PPU only (`PPU2SPU` and
+  `ANY2ANY`), in the `CellSyncLFQueue` layout that a task's own pop code
+  reads; where an `ANY2ANY` queue keeps its waiters' counters (in the pop and
+  push wait flags) was read off Edge zlib's inflate task, which RPCS3 does not
+  implement. A PPU that finds a queue full polls it every 50 microseconds
+  rather than waiting on the attached event queue. SPURS queues and barriers
+  answer `CELL_OK` and do nothing: their layouts are what the tasks' own code
+  reads, and are not read yet.
 - The SPU's events: only the lock-line reservation lost (`0x400`) is raised,
   by polling the reserved line every 20 microseconds while the SPU waits.
 - Inline image transfers (NV308A into the NV3062 surface) are taken to be on

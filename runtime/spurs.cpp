@@ -31,8 +31,16 @@
 // protocol is the tasks' own code: a PPU waiter blocks on the queue attached
 // to the flag, a waiting task is woken by its signal.
 //
-// Queues, lock-free queues and barriers are not implemented yet: they are
-// reported and answer CELL_OK having done nothing.
+// Lock-free queues keep the system's layout too (CellSyncLFQueue, 128 bytes),
+// for the same reason: the tasks pop them with their own code. The PPU pushes;
+// a task that found the queue empty has left its signal id in the queue, and
+// the push that fills it signals the task.
+//
+// Queues keep the layout the tasks' own code reads too; the PPU pops and
+// pushes them, and wakes the tasks waiting on them.
+//
+// Barriers are not implemented yet: they are reported and answer CELL_OK
+// having done nothing.
 #include "rt.h"
 #include "spu.h"
 #include <condition_variable>
@@ -69,7 +77,7 @@ struct Taskset {
     std::string name;
     bool shutdown = false;
     int live = 0;
-    uint32_t next_task = 0;
+    bool used[128] = {};                           // task ids taken; an exited task frees its id
 };
 std::map<uint32_t, Taskset> g_tasksets;
 
@@ -103,6 +111,7 @@ struct Task : SPUHost {
     std::unique_ptr<uint8_t[]> ls{new uint8_t[SPU_LS_SIZE]()};
     std::vector<uint32_t> in_mbox;
     uint32_t out_mbox = 0;
+    bool abandoned = false;                        // left waiting when its taskset was shut down
     bool out_full = false;
 
     bool rdch(SPUContext&, uint32_t ch, uint32_t& v) override {
@@ -153,7 +162,17 @@ struct Task : SPUHost {
         return true;
     }
 
-    // The module's answer to a syscall; false when the task has exited.
+    // A shut-down workload is no longer scheduled: a task that yields or
+    // waits is never resumed, and ends there without an exit code.
+    bool shut_down() {
+        std::lock_guard<std::mutex> lk(g_mx);
+        auto it = g_tasksets.find(taskset);
+        abandoned = it == g_tasksets.end() || it->second.shutdown;
+        return abandoned;
+    }
+
+    // The module's answer to a syscall; false when the task has exited or
+    // been abandoned.
     bool syscall() {
         uint32_t num = s.r[3].u32[3], arg4 = s.r[4].u32[3];
         if (g_trace) rt_log("spurs task %u: syscall %X (%08X)", id, num, arg4);
@@ -161,6 +180,7 @@ struct Task : SPUHost {
         case 0:                                    // exit
             return false;
         case 1:                                    // yield
+            if (shut_down()) return false;
             std::this_thread::yield();
             s.r[3] = spu_slot(0);
             return true;
@@ -177,6 +197,7 @@ struct Task : SPUHost {
                         break;
                     }
                 }
+                if (shut_down()) return false;
                 std::this_thread::sleep_for(std::chrono::microseconds(50));
             }
             s.r[3] = spu_slot(0);
@@ -270,10 +291,13 @@ void* task_main(void* p) {
     }
     bit_set(t->taskset, TS_RUNNING, t->id, false);
     bit_set(t->taskset, TS_ENABLED, t->id, false);
-    exit_code_set(t->exit_container, exit_code);
-    if (g_trace) rt_log("spurs task %u of %08X: exited with %d", t->id, t->taskset, (int)exit_code);
+    if (t->abandoned) rt_log("spurs task %u of %08X: its taskset is shut down; the task is not resumed", t->id, t->taskset);
+    else exit_code_set(t->exit_container, exit_code);
+    if (g_trace && !t->abandoned) rt_log("spurs task %u of %08X: exited with %d", t->id, t->taskset, (int)exit_code);
     std::lock_guard<std::mutex> lk(g_mx);
-    --g_tasksets[t->taskset].live;
+    Taskset& ts = g_tasksets[t->taskset];
+    ts.used[t->id] = false;
+    --ts.live;
     g_cv.notify_all();
     return nullptr;
 }
@@ -286,8 +310,11 @@ uint32_t create_task(uint32_t taskset, uint32_t id_out, uint32_t elf, uint32_t c
         auto it = g_tasksets.find(taskset);
         if (it == g_tasksets.end()) { delete t; return TASK_ERROR_SRCH; }
         Taskset& ts = it->second;
-        if (ts.next_task >= 128) { delete t; return TASK_ERROR_AGAIN; }
-        t->id = ts.next_task++;
+        uint32_t id = 0;
+        while (id < 128 && ts.used[id]) ++id;
+        if (id == 128) { delete t; return TASK_ERROR_AGAIN; }
+        ts.used[id] = true;
+        t->id = id;
         t->spurs = ts.spurs;
         ++ts.live;
     }
@@ -419,6 +446,9 @@ PS3_HLE(cellSpursCreateTasksetWithAttribute) {   // (spurs, taskset, attr)
         g_tasksets[tsa] = ts;
     }
     st32(tsa + 0x74, ts.wid);
+    // the workload's argument in the instance (wklInfo1[wid].arg), where a task
+    // finds the taskset of a workload it signals
+    if (ts.wid < 16) st64(sp + 0xB00 + 0x20 * ts.wid + 8, tsa);
     rt_log("spurs: taskset %08X \"%s\" on %08X, workload %u", tsa, ts.name.c_str(), sp, ts.wid);
     c.r[3] = CELL_OK;
 }
@@ -652,20 +682,280 @@ PS3_HLE(cellSpursEventFlagWait) {           // (eventFlag, u16* mask, mode)
     c.r[3] = CELL_OK;
 }
 
-// ---- not yet: queues, lock-free queues, barriers ----------------------------------------
+// ---- not yet: barriers -----------------------------------------------------------------
 #define SPURS_LATER(name)                                                                   \
     PS3_HLE(name) {                                                                         \
         rt_log("spurs: " #name "(%08X, %08X, %08X, %08X) is not implemented; it answers CELL_OK", \
                arg_u32(c, 0), arg_u32(c, 1), arg_u32(c, 2), arg_u32(c, 3));                \
         c.r[3] = CELL_OK;                                                                   \
     }
-SPURS_LATER(_cellSpursQueueInitialize)
-SPURS_LATER(cellSpursQueueAttachLv2EventQueue)
-SPURS_LATER(cellSpursQueueDetachLv2EventQueue)
-SPURS_LATER(cellSpursQueuePushBody)
-SPURS_LATER(cellSpursQueuePopBody)
-SPURS_LATER(_cellSpursLFQueueInitialize)
-SPURS_LATER(cellSpursLFQueueAttachLv2EventQueue)
-SPURS_LATER(cellSpursLFQueueDetachLv2EventQueue)
-SPURS_LATER(_cellSpursLFQueuePushBody)
 SPURS_LATER(cellSpursBarrierInitialize)
+
+// ---- lock-free queues ------------------------------------------------------------------
+// CellSpursLFQueue is a CellSyncLFQueue: +0 pop pointers (u16 each: committed,
+// completion bitmap, wait flag, reserved), +8 push pointers (the same four),
+// +0x10 element size, +0x14 depth, +0x18 buffer (u64, bit 0 set for ANY2ANY),
+// +0x20 SPU ports (4 bytes), +0x24 direction, +0x28 v1, +0x2C init, +0x30 the
+// pack of tasks waiting to pop, +0x32 their signal ids (15 u16), +0x50 the
+// pack of tasks waiting to push, +0x52 their ids, +0x70 where a signal goes
+// (the taskset, or the instance with bit 0 set), +0x78 v2, +0x7C event queue.
+// The pointers run modulo twice the depth. A pack is three 5-bit counters
+// modulo 30: the next waiter to wake (bits 10-14), the woken waiters that have
+// taken their element (5-9), and the next free waiting place (0-4). In an
+// ANY2ANY queue the packs live in the pop and push wait flags (+4 and +0xC)
+// and +0x30 and +0x50 hold 0xFFFF: Edge zlib's inflate task, whose own code
+// pops the queue, reads them there. A signal id is (workload << 8) | task.
+//
+// The PPU pushes with the queue's line under the SPUs' atomic lock, so a
+// task's GETLLAR/PUTLLC on the queue sees each step whole. A PPU that finds
+// the queue full polls it instead of waiting on the attached event queue: it
+// never leaves itself among the push waiters.
+namespace {
+constexpr uint32_t LFQ_PPU2SPU = 2, LFQ_ANY2ANY = 3;
+constexpr uint32_t SPURS_SYNC_AGAIN = 0x80410901u, SPURS_SYNC_INVAL = 0x80410902u, SPURS_SYNC_PERM = 0x80410909u,
+                   SPURS_SYNC_STAT = 0x8041090Fu, SPURS_SYNC_ALIGN = 0x80410910u, SPURS_SYNC_NULL = 0x80410911u;
+
+// v, a step off the range [0, n), brought back into it
+int32_t ring(int32_t v, int32_t n) { return v < 0 ? v + n : v >= n ? v - n : v; }
+
+// Signal the task whose id a waiter left: in the queue's taskset, or, for a
+// queue of the instance, in the taskset that runs that workload.
+void lfq_signal(uint32_t q, uint32_t id) {
+    uint64_t to = ld64(q + 0x70);
+    uint32_t wid = id >> 8, task = id & 0xFF, taskset = (uint32_t)to;
+    if (to & 15) {
+        uint32_t sp = (uint32_t)to & ~15u;
+        taskset = 0;
+        std::lock_guard<std::mutex> lk(g_mx);
+        for (auto& [a, ts] : g_tasksets)
+            if (ts.spurs == sp && ts.wid == wid) taskset = a;
+    }
+    if (g_trace) rt_log("spurs: lock-free queue %08X signals task %u of workload %u (taskset %08X)", q, task, wid, taskset);
+    if (!taskset) { rt_log("spurs: lock-free queue %08X: no taskset runs workload %u; the signal is lost", q, wid); return; }
+    send_signal(taskset, task);
+}
+}  // namespace
+
+PS3_HLE(_cellSpursLFQueueInitialize) {   // (tasksetOrSpurs, queue, buffer, size, depth, direction)
+    uint32_t to = arg_u32(c, 0), q = arg_u32(c, 1), buf = arg_u32(c, 2), size = arg_u32(c, 3), depth = arg_u32(c, 4),
+             dir = arg_u32(c, 5);
+    if (!q || (size && !buf)) { c.r[3] = SPURS_SYNC_NULL; return; }
+    if (size > 0x4000 || size % 16 || !depth || depth > 0x7FFF || dir > LFQ_ANY2ANY) { c.r[3] = SPURS_SYNC_INVAL; return; }
+    if (q % 128 || buf % 16) { c.r[3] = SPURS_SYNC_ALIGN; return; }
+    {
+        std::lock_guard<std::mutex> lk(spu_atomic_mutex());
+        std::memset(g_mem + q, 0, 128);
+        st32(q + 0x10, size);
+        st32(q + 0x14, depth);
+        st64(q + 0x18, dir == LFQ_ANY2ANY ? buf | 1 : buf);
+        st32(q + 0x20, dir == LFQ_ANY2ANY ? 0xFFFF0000u : 0xFFFFFFFFu);
+        st32(q + 0x24, dir);
+        st32(q + 0x28, dir == LFQ_ANY2ANY ? 0xFFFFFFFFu : 0);
+        st16(q + 0x30, dir == LFQ_ANY2ANY ? 0xFFFF : 0);
+        st16(q + 0x50, dir == LFQ_ANY2ANY ? 0xFFFF : 0);
+        st64(q + 0x70, to);
+    }
+    rt_log("spurs: lock-free queue %08X, %u elements of %u bytes at %08X, direction %u, signals to %08X", q, depth, size,
+           buf, dir, to);
+    c.r[3] = CELL_OK;
+}
+
+PS3_HLE(cellSpursLFQueueAttachLv2EventQueue) {   // (queue): for a PPU that waits, which this one never does
+    uint32_t q = arg_u32(c, 0);
+    if (ld32(q + 0x7C)) { c.r[3] = SPURS_SYNC_STAT; return; }
+    st32(q + 0x7C, lv2_event_queue_new(127));
+    c.r[3] = CELL_OK;
+}
+
+PS3_HLE(cellSpursLFQueueDetachLv2EventQueue) {   // (queue)
+    uint32_t q = arg_u32(c, 0);
+    if (!ld32(q + 0x7C)) { c.r[3] = SPURS_SYNC_STAT; return; }
+    st32(q + 0x7C, 0);
+    c.r[3] = CELL_OK;
+}
+
+PS3_HLE(_cellSpursLFQueuePushBody) {   // (queue, element, isBlocking)
+    uint32_t q = arg_u32(c, 0), elem = arg_u32(c, 1), blocking = arg_u32(c, 2);
+    if (!q || !elem) { c.r[3] = SPURS_SYNC_NULL; return; }
+    if (q % 128 || elem % 16) { c.r[3] = SPURS_SYNC_ALIGN; return; }
+    uint32_t dir = ld32(q + 0x24);
+    if (dir != LFQ_PPU2SPU && dir != LFQ_ANY2ANY) { c.r[3] = SPURS_SYNC_PERM; return; }
+    const int32_t depth = (int32_t)ld32(q + 0x14), d2 = 2 * depth;
+    const uint32_t pop_pack = dir == LFQ_ANY2ANY ? q + 4 : q + 0x30, push_pack = dir == LFQ_ANY2ANY ? q + 0xC : q + 0x50;
+    // a place: free, not owed to a woken pusher, with no pusher waiting first
+    // and fewer than 16 pushes under way (the completion bitmap's width)
+    int32_t pos;
+    for (bool polled = false;; polled = true) {
+        {
+            std::lock_guard<std::mutex> lk(spu_atomic_mutex());
+            int32_t h1 = ld16(q), h5 = ld16(q + 8), h8 = (int16_t)ld16(q + 0xE);
+            int32_t pack = ld16(push_pack), a = pack >> 10 & 31, b = pack >> 5 & 31, w = pack & 31;
+            int32_t used = ring(h8 - h1, d2), owed = ring(a - b, 30), busy = ring(h8 - h5, d2);
+            if (depth - used > owed && busy + owed <= 15 && a == w) {
+                pos = h8;
+                st16(q + 0xE, (uint16_t)(h8 + 1 >= d2 ? 0 : h8 + 1));
+                break;
+            }
+        }
+        if (!blocking) { c.r[3] = SPURS_SYNC_AGAIN; return; }
+        if (!polled && g_trace) rt_log("spurs: lock-free queue %08X is full; the PPU polls it", q);
+        std::this_thread::sleep_for(std::chrono::microseconds(50));
+    }
+    uint32_t size = ld32(q + 0x10), buf = (uint32_t)ld64(q + 0x18) & ~1u;
+    std::memcpy(g_mem + buf + size * (uint32_t)(pos >= depth ? pos - depth : pos), g_mem + elem, size);
+    // complete it: the committed pointer moves over every completed place in
+    // order, and the first task waiting to pop is woken, unless 16 pops would
+    // then be under way or owed
+    int32_t wake = -1;
+    {
+        std::lock_guard<std::mutex> lk(spu_atomic_mutex());
+        int32_t h1 = ld16(q), h4 = (int16_t)ld16(q + 6), h5 = ld16(q + 8);
+        uint32_t done = ld16(q + 0xA) | 0x8000u >> ring(pos - h5, d2);
+        int32_t n = 0;
+        while (n < 16 && (done << n & 0x8000u)) ++n;
+        st16(q + 0xA, (uint16_t)(n >= 16 ? 0 : done << n));
+        st16(q + 8, (uint16_t)ring(h5 + n, d2));
+        int32_t pack = ld16(pop_pack), a = pack >> 10 & 31, b = pack >> 5 & 31, w = pack & 31;
+        if (a != w && ring(h4 - h1, d2) + ring(a - b, 30) <= 15) {
+            wake = ld16(q + 0x32 + 2 * (a >= 15 ? a - 15 : a));
+            st16(pop_pack, (uint16_t)((pack & 0x83FF) | (a == 29 ? 0 : a + 1) << 10));
+        }
+    }
+    if (g_trace) rt_log("spurs: lock-free queue %08X: pushed at %d%s", q, pos, wake >= 0 ? ", a task waiting" : "");
+    if (wake >= 0) lfq_signal(q, (uint32_t)wake);
+    c.r[3] = CELL_OK;
+}
+
+// ---- queues ----------------------------------------------------------------------------
+// CellSpursQueue (128 bytes), as Bullet's narrow-phase task pops and pushes
+// it with its own code: +0 the pop pointer, +4 the push pointer (s32 each,
+// modulo twice the depth, stored complemented while a pop or a push is under
+// way), +8 element size, +0xC depth, +0x10 buffer (u64), +0x18 the SPU port
+// of the event queue attached for a PPU that waits (above 63: none), +0x1C
+// direction, +0x20 the number of tasks waiting to pop and +0x21 their task
+// ids, +0x30 the same for tasks waiting to push, +0x40 the number again and
+// +0x41 the waiting poppers' workloads, +0x50 the pushers' workloads, +0x60
+// the taskset (u64, 0 for a queue of the instance). A task that finishes a pop
+// wakes the next popper and the first pusher; one that finishes a push, the
+// first popper.
+//
+// The PPU pops and pushes each element whole under the SPUs' atomic lock, so
+// it never leaves a pointer complemented; it wakes the waiters as a task
+// would. A PPU that would wait polls instead, every 50 microseconds, and the
+// event queue it attaches is never sent to.
+namespace {
+constexpr uint32_t Q_SPU2PPU = 1, Q_PPU2SPU = 2, Q_ANY2ANY = 3;
+constexpr uint32_t SPURS_SYNC_BUSY = 0x8041090Au;
+
+struct QueueOwner { uint32_t spurs, eq; };
+std::map<uint32_t, QueueOwner> g_queues;            // by the queue's address
+
+int32_t q_ptr(int32_t v) { return v < 0 ? ~v : v; }
+
+struct Waiter { uint32_t task, wid; };
+
+// The first task of a waiting list (+0x20 poppers, +0x30 pushers), if any.
+void q_first(uint32_t q, uint32_t list, std::vector<Waiter>& wake) {
+    if (ld8(q + list)) wake.push_back({ld8(q + list + 1), ld8(q + list + 0x21)});
+}
+
+// Wake a waiting task: by the queue's taskset, or by its workload.
+void q_wake(uint32_t q, Waiter w) {
+    uint32_t task = w.task, wid = w.wid, taskset = (uint32_t)ld64(q + 0x60);
+    if (!taskset) {
+        std::lock_guard<std::mutex> lk(g_mx);
+        uint32_t sp = g_queues.count(q) ? g_queues[q].spurs : 0;
+        for (auto& [a, ts] : g_tasksets)
+            if (ts.spurs == sp && ts.wid == wid) taskset = a;
+    }
+    if (g_trace) rt_log("spurs: queue %08X wakes task %u of taskset %08X", q, task, taskset);
+    if (taskset) send_signal(taskset, task);
+    else rt_log("spurs: queue %08X: no taskset runs workload %u; the signal is lost", q, wid);
+}
+
+// One element in or out, whole; CELL_OK, or the error to answer or wait on.
+uint32_t q_move(uint32_t q, uint32_t elem, bool push, std::vector<Waiter>& wake) {
+    std::lock_guard<std::mutex> lk(spu_atomic_mutex());
+    int32_t w0 = (int32_t)ld32(q), w1 = (int32_t)ld32(q + 4), depth = (int32_t)ld32(q + 0xC), d2 = 2 * depth;
+    int32_t n0 = q_ptr(w0), n1 = q_ptr(w1), count = ring(n1 - n0, d2);
+    uint32_t size = ld32(q + 8), buf = (uint32_t)ld64(q + 0x10);
+    if (push) {
+        if (count >= depth) return SPURS_SYNC_AGAIN;
+        if (w1 < 0 || ld8(q + 0x30)) return SPURS_SYNC_BUSY;
+        std::memcpy(g_mem + buf + size * (uint32_t)(n1 >= depth ? n1 - depth : n1), g_mem + elem, size);
+        st32(q + 4, (uint32_t)(n1 + 1 >= d2 ? 0 : n1 + 1));
+        q_first(q, 0x20, wake);
+        if (count + 1 < depth) q_first(q, 0x30, wake);
+    } else {
+        if (count == 0) return SPURS_SYNC_AGAIN;
+        if (w0 < 0 || ld8(q + 0x20)) return SPURS_SYNC_BUSY;
+        std::memcpy(g_mem + elem, g_mem + buf + size * (uint32_t)(n0 >= depth ? n0 - depth : n0), size);
+        st32(q, (uint32_t)(n0 + 1 >= d2 ? 0 : n0 + 1));
+        if (count > 1) q_first(q, 0x20, wake);
+        q_first(q, 0x30, wake);
+    }
+    return CELL_OK;
+}
+
+void q_body(PPUContext& c, bool push) {   // (queue, element, isBlocking)
+    uint32_t q = arg_u32(c, 0), elem = arg_u32(c, 1), blocking = arg_u32(c, 2);
+    if (!q || !elem) { c.r[3] = SPURS_SYNC_NULL; return; }
+    if (q % 128 || elem % 16) { c.r[3] = SPURS_SYNC_ALIGN; return; }
+    uint32_t dir = ld32(q + 0x1C);
+    if (dir != Q_ANY2ANY && dir != (push ? Q_PPU2SPU : Q_SPU2PPU)) { c.r[3] = SPURS_SYNC_PERM; return; }
+    for (bool polled = false;; polled = true) {
+        std::vector<Waiter> wake;
+        uint32_t r = q_move(q, elem, push, wake);
+        for (const Waiter& w : wake) q_wake(q, w);
+        if (r == CELL_OK || !blocking) { c.r[3] = r; return; }
+        if (!polled && g_trace) rt_log("spurs: queue %08X is %s; the PPU polls it", q, push ? "full" : "empty");
+        std::this_thread::sleep_for(std::chrono::microseconds(50));
+    }
+}
+}  // namespace
+
+PS3_HLE(_cellSpursQueueInitialize) {   // (spurs, taskset, queue, buffer, size, depth, direction)
+    uint32_t sp = arg_u32(c, 0), ts = arg_u32(c, 1), q = arg_u32(c, 2), buf = arg_u32(c, 3), size = arg_u32(c, 4),
+             depth = arg_u32(c, 5), dir = arg_u32(c, 6);
+    if (!q || !buf || (!sp && !ts)) { c.r[3] = SPURS_SYNC_NULL; return; }
+    if (!size || size % 16 || !depth || depth > 0x7FFF || dir > Q_ANY2ANY) { c.r[3] = SPURS_SYNC_INVAL; return; }
+    if (q % 128 || buf % 16) { c.r[3] = SPURS_SYNC_ALIGN; return; }
+    {
+        std::lock_guard<std::mutex> lk(spu_atomic_mutex());
+        std::memset(g_mem + q, 0, 128);
+        st32(q + 8, size);
+        st32(q + 0xC, depth);
+        st64(q + 0x10, buf);
+        st32(q + 0x18, 0xFF);
+        st32(q + 0x1C, dir);
+        st64(q + 0x60, ts);
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_mx);
+        g_queues[q] = {ts ? (uint32_t)ld64(ts + 0x60) : sp, 0};
+    }
+    if (g_trace) rt_log("spurs: queue %08X, %u elements of %u bytes at %08X, direction %u", q, depth, size, buf, dir);
+    c.r[3] = CELL_OK;
+}
+
+PS3_HLE(cellSpursQueueAttachLv2EventQueue) {   // (queue): for a PPU that waits, which this one never does
+    uint32_t q = arg_u32(c, 0);
+    std::lock_guard<std::mutex> lk(g_mx);
+    auto it = g_queues.find(q);
+    if (it == g_queues.end()) { c.r[3] = SPURS_SYNC_STAT; return; }
+    if (it->second.eq) { c.r[3] = SPURS_SYNC_STAT; return; }
+    it->second.eq = lv2_event_queue_new(127);
+    c.r[3] = CELL_OK;
+}
+
+PS3_HLE(cellSpursQueueDetachLv2EventQueue) {   // (queue)
+    uint32_t q = arg_u32(c, 0);
+    std::lock_guard<std::mutex> lk(g_mx);
+    auto it = g_queues.find(q);
+    if (it == g_queues.end() || !it->second.eq) { c.r[3] = SPURS_SYNC_STAT; return; }
+    it->second.eq = 0;
+    c.r[3] = CELL_OK;
+}
+
+PS3_HLE(cellSpursQueuePushBody) { q_body(c, true); }   // (queue, element, isBlocking)
+PS3_HLE(cellSpursQueuePopBody) { q_body(c, false); }   // (queue, buffer, isBlocking)
