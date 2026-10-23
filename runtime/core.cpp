@@ -40,11 +40,12 @@ void ppu_bctr(PPUContext& c) {
     ppu_call_indirect(c, (uint32_t)c.ctr);
 }
 
-uint64_t ppu_call_guest(PPUContext& c, uint32_t desc, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3) {
+uint64_t ppu_call_guest(PPUContext& c, uint32_t desc, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
+                        uint64_t a4) {
     PPUContext saved = c;
     uint32_t entry = ld32(desc), toc = ld32(desc + 4);
     c.r[2] = toc;
-    c.r[3] = a0; c.r[4] = a1; c.r[5] = a2; c.r[6] = a3;
+    c.r[3] = a0; c.r[4] = a1; c.r[5] = a2; c.r[6] = a3; c.r[7] = a4;
     c.lr = mm::HLE_CODE - 4;                     // a return address no code lives at
     ppu_call_indirect(c, entry);
     uint64_t r = c.r[3];

@@ -21,7 +21,7 @@ submodule at `ps3kit/`.
 | Port | Game | What it asked of ps3kit |
 |---|---|---|
 | [pc-ragnarokodysseyace](https://github.com/vs-sr-dev/pc-ragnarokodysseyace) | Ragnarok Odyssey ACE (2013) | everything so far: the descriptor table, the imports, the PPU recompiler, the process start, threads, files, the command buffer to its first flip, the audio ports and their clock, the window, the RSX's draws: the publishers' logos; save data; cellSail and an MPEG-2 decoder: the first movie; the controller: the title screen, the main menu and character creation; the SPU recompiler and a job manager: CRI's sound, heard; cellFont with an OpenType/CFF reader and a rasterizer of its own: character creation's text; system events and the on-screen keyboard: the hero's name |
-| [pc-3ddotgameheroes](https://github.com/vs-sr-dev/pc-3ddotgameheroes) | 3D Dot Game Heroes (2009) | the SPUs: SPU ELFs recompiled at their load address, lv2 SPU thread groups (FMOD's mixer), SPURS task sets, tasks and event flags on a kernel of the runtime's own, `spu_printf`; switch tables the compiler did not optimise; the I/O map, reports and inline image transfers (the fragment programs); audio notifications; `/dev_flash` and `/dev_hdd1`: the publishers' and the middleware's logos |
+| [pc-3ddotgameheroes](https://github.com/vs-sr-dev/pc-3ddotgameheroes) | 3D Dot Game Heroes (2009) | the SPUs: SPU ELFs recompiled at their load address, lv2 SPU thread groups (FMOD's mixer), SPURS task sets, tasks and event flags on a kernel of the runtime's own, `spu_printf`; switch tables the compiler did not optimise; the I/O map, reports and inline image transfers (the fragment programs); audio notifications; `/dev_flash` and `/dev_hdd1`: the publishers' and the middleware's logos; trophies, read from the disc's set and kept; SPU modules recompiled where their loader puts them (FMOD's codec): the title screen, its demo play and FMOD's music |
 
 ## Using it
 
@@ -51,7 +51,9 @@ game alone, `--quit-after SECONDS` ends the run, and `--dump DIR` writes
 every 60th shown frame as a PNG (`--dump-every N` for another interval).
 
 Debugging a run: `ps3boot` reports a host fault with the guest address it
-touched, and [`gdb_trace.py`](gdb_trace.py) traces any recompiled function
+touched (in a library, such as the C runtime's `memcpy`, with the library's
+name and the executable's addresses found on the stack above it, which `nm`
+names), and [`gdb_trace.py`](gdb_trace.py) traces any recompiled function
 under gdb (arguments, result, the guest call chain) with no debug build:
 
 ```sh
@@ -67,7 +69,8 @@ constants and state, `PS3KIT_SHADERDUMP=1` every program pair as GLSL,
 `PS3KIT_GLDEBUG=1` the OpenGL driver's complaints, `PS3KIT_GLSYNC=N` each
 draw from draw N on, waited for (so that a draw which brings the driver down
 is the last one reported), `PS3KIT_SAVEDATA=1` each save
-data step and callback result, `PS3KIT_SAIL=1` each movie player call and
+data step and callback result, `PS3KIT_TROPHY=1` each trophy context and
+status reported to the game, `PS3KIT_SAIL=1` each movie player call and
 event and every 30th frame shown.
 
 `PS3KIT_SPU=1` reports each SPU program's first job and how long its jobs
@@ -156,8 +159,8 @@ position-independent and relocate themselves.
 |---|---|---|---|
 | 1. Recognise | What is in this executable? | `elf`: segments, process parameters, TLS, the descriptor table, imports by name; SPURS job binaries by their job-runtime header; SPU ELFs by their header and `.note.spu_name` (`recomp.spu.find_elfs`) | task sets, the middleware it links |
 | 2. Read code | What does this function do? | `ppu`: the PPU decoder, disassembly, census; `spu`: the same for the SPU | cross-references through the TOC |
-| 3. Recompile | The code as C++ | `recomp`: discovery, switch tables, the whole user-mode PPU set and the VMX operations games use; each SPU program whole, every SPU instruction but `bisled` and the double compares by magnitude: SPURS jobs, and SPU ELFs at their load address, dispatching only where an indirect branch can land | SPU modules that another SPU program relocates (FMOD's codecs and effects) |
-| 4. Run | The PS3 under the game | `runtime`: memory map, dispatch, loader, imports, lv2 calls, the process start; PPU threads, lightweight and lv2 synchronisation, event queues; the file system (cellFs and sys_fs); cellGame; cellGcmSys and cellResc with a FIFO consumer, labels, reports, the I/O map, flips and a 59.94 Hz vblank; the renderer (SDL3, OpenGL 4.5): a window, render targets on the host GPU, clears, draws with vertex and fragment programs translated to GLSL, textures, blending, flips; video out; cellAudio and the audio output, with the 48 kHz clock that consumes the ports and plays them through SDL3; SPURS job queues with a job manager running recompiled SPU programs: the SPU's channels, its DMA and atomic unit, the lock-line reservation event; lv2 SPU images and thread groups, the threads' mailboxes, event ports and local stores; SPURS instances, task sets, tasks, exit codes and event flags, on a kernel of the runtime's own; save data (Auto, ListAuto, Fixed) with PARAM.SFO; cellSail playing PAMF through the runtime's own MPEG-2 decoder; cellPad from the host's gamepad and keyboard; system events raised through cellSysutilCheckCallback; cellOskDialog typed on the host's keyboard; cellFont over the runtime's own OpenType reader (CFF outlines, name- or CID-keyed) and coverage rasterizer | the rest of the 3D engine's state (fog, clip planes, two-sided colour, point sprites), TrueType outlines and the system's font sets, the list save dialogs, SPURS queues, lock-free queues and barriers |
+| 3. Recompile | The code as C++ | `recomp`: discovery, switch tables, the whole user-mode PPU set and the VMX operations games use; each SPU program whole, every SPU instruction but `bisled` and the double compares by magnitude: SPURS jobs, and SPU ELFs at their load address, dispatching only where an indirect branch can land; SPU modules another SPU program loads (FMOD's codecs and effects), at the bias a run shows (`--spu-module-bias`) | |
+| 4. Run | The PS3 under the game | `runtime`: memory map, dispatch, loader, imports, lv2 calls, the process start; PPU threads, lightweight and lv2 synchronisation, event queues; the file system (cellFs and sys_fs); cellGame; cellGcmSys and cellResc with a FIFO consumer, labels, reports, the I/O map, flips and a 59.94 Hz vblank; the renderer (SDL3, OpenGL 4.5): a window, render targets on the host GPU, clears, draws with vertex and fragment programs translated to GLSL, textures, blending, flips; video out; cellAudio and the audio output, with the 48 kHz clock that consumes the ports and plays them through SDL3; SPURS job queues with a job manager running recompiled SPU programs: the SPU's channels, its DMA and atomic unit, the lock-line reservation event; lv2 SPU images and thread groups, the threads' mailboxes, event ports and local stores; SPURS instances, task sets, tasks, exit codes and event flags, on a kernel of the runtime's own; save data (Auto, ListAuto, Fixed) with PARAM.SFO; trophies (sceNpTrophy) from the disc's TROPHY.TRP, the unlocks kept on `/dev_hdd0`; SPU modules run as overlays when their loader branches into them; cellSail playing PAMF through the runtime's own MPEG-2 decoder; cellPad from the host's gamepad and keyboard; system events raised through cellSysutilCheckCallback; cellOskDialog typed on the host's keyboard; cellFont over the runtime's own OpenType reader (CFF outlines, name- or CID-keyed) and coverage rasterizer | the rest of the 3D engine's state (fog, clip planes, two-sided colour, point sprites), TrueType outlines and the system's font sets, the list save dialogs, SPURS queues, lock-free queues and barriers |
 
 ## Known approximations
 
@@ -341,6 +344,13 @@ Declared here as they are made, so that the list is the cost:
   A terminated group's threads end at their next channel access or stop;
   `sys_spu_thread_group_suspend` is reported and not done. Only the user
   event ports (`SYS_SPU_THREAD_EVENT_USER`) connect.
+- A relocatable SPU module (FMOD's codecs and effects) is recompiled at
+  one or more biases given to the recompiler, read off a run of the game
+  (`--spu-module-bias`): every module at every bias, every instruction a
+  possible target. A branch out of a program runs the overlay whose image
+  local store holds at that address, compared whole on every entry; a module
+  copied anywhere else is reported once and ends the program, as before.
+  The `.fixup` words a loader patches are data, and are not compared.
 - SPURS has a kernel of the runtime's own that does not schedule: every task
   runs on a host thread of its own from its creation, whatever the number of
   SPUs the instance was given. The taskset policy module's context and the
@@ -364,6 +374,16 @@ Declared here as they are made, so that the list is the cost:
   (`0x0FE00000`), the main-memory ones at I/O offset `0x0E000000`. A
   `ZPASS_PIXEL_CNT` report is always `0x100000` (everything passes); the
   other kinds write 0.
+- Trophies: the set is the disc's `PS3_GAME/TROPDIR/<id>/TROPHY.TRP`, its
+  `TROP_01.SFM` (English, the language cellSysutil reports) or `TROP.SFM`.
+  Registering reports installed or not installed, then setup, progress (one
+  step per trophy), finalize and complete, on the calling thread. The unlocks
+  are kept as `id tick` lines in `PS3KIT.TROPUSR` under
+  `/dev_hdd0/home/00000001/trophy/<id>`, the runtime's own record; the
+  system's `TROPUSR.DAT` and `TROPTROP.DAT` are not made, no icon is
+  installed and no notification is drawn (the runtime logs each unlock). A
+  disc without the package gets an empty set: registration succeeds, and
+  any trophy number unlocks.
 - `cellFsGetFreeSize` reports the free space `cellGameBootCheck` does,
   40,000,000 KB, whatever the host has.
 - The system cache relays a cache whose directory exists from an earlier

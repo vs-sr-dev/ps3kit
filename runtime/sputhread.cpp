@@ -244,7 +244,8 @@ Group* group_of(uint32_t id) {
 
 // ---- images -------------------------------------------------------------------------
 // sys_spu_image_t: u32 type, u32 entry_point, u32 segs, s32 nsegs.
-// sys_spu_segment_t: s32 type, u32 ls, u32 size, u32 addr or fill value, u32 pad.
+// sys_spu_segment_t: s32 type, u32 ls, u32 size, then at +0x10 a union of the u32
+// addr or fill value with a u64 (which aligns it to 8): 0x18 bytes.
 static uint32_t image_from_elf(uint32_t img, uint32_t src) {
     if (ld32(src) != 0x7F454C46u || ld16(src + 18) != 23) return CELL_EINVAL;
     uint32_t entry = ld32(src + 24), phoff = ld32(src + 28);
@@ -265,7 +266,7 @@ static uint32_t image_from_elf(uint32_t img, uint32_t src) {
     for (size_t i = 0; i < segs.size(); ++i) {
         uint32_t a = table + 0x18 * (uint32_t)i;
         st32(a, segs[i].type); st32(a + 4, segs[i].ls); st32(a + 8, segs[i].size);
-        st32(a + 12, segs[i].addr); st32(a + 16, 0); st32(a + 20, 0);
+        st32(a + 12, 0); st32(a + 16, segs[i].addr); st32(a + 20, 0);
     }
     st32(img, 0);                                  // SYS_SPU_IMAGE_TYPE_USER
     st32(img + 4, entry);
@@ -334,7 +335,7 @@ LV2_SYSCALL(172, sys_spu_thread_initialize) {      // (u32* thread, group, spu n
     uint32_t table = ld32(img + 8), n = ld32(img + 12);
     for (uint32_t i = 0; i < n; ++i) {
         uint32_t a = table + 0x18 * i;
-        t->segs.push_back({ld32(a), ld32(a + 4), ld32(a + 8), ld32(a + 12)});
+        t->segs.push_back({ld32(a), ld32(a + 4), ld32(a + 8), ld32(a + 16)});
     }
     auto it = g_image_elf.find(table);
     t->elf = it == g_image_elf.end() ? 0 : it->second;

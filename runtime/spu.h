@@ -99,7 +99,10 @@ uint32_t spu_missed(SPUContext& s, uint32_t pc);
 // The recompiled program of an SPU ELF (by the ELF's address), or null.
 const SPUProgram* spu_program_of(uint32_t elf);
 // Run from pc until the program stops (SPU_STOPPED) or branches out of
-// `prog` (that address is returned).
+// `prog` (that address is returned). A branch into a module the program has
+// copied into local store runs the module's overlay (a recompiled module
+// whose image local store holds at its address), back to `prog` when it
+// returns.
 uint32_t spu_run(SPUContext& s, const SPUProgram* prog, uint32_t pc);
 [[noreturn]] void spu_halt(SPUContext& s, uint32_t pc);
 [[noreturn]] void spu_illegal(SPUContext& s, uint32_t pc, uint32_t word);

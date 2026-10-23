@@ -79,7 +79,7 @@ PPUFunc ppu_lookup(uint32_t addr);
 // would: r2 from the descriptor, arguments in r3..., result in r3. The
 // caller's registers are saved around it except r3.
 uint64_t ppu_call_guest(PPUContext& c, uint32_t desc, uint64_t a0 = 0, uint64_t a1 = 0,
-                        uint64_t a2 = 0, uint64_t a3 = 0);
+                        uint64_t a2 = 0, uint64_t a3 = 0, uint64_t a4 = 0);
 // Thrown by sys_process_exit and friends; caught by the boot.
 struct PPUExit { int code; };
 // Thrown by sys_ppu_thread_exit; ends the guest thread, not the process.

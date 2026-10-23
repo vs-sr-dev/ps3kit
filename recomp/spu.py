@@ -18,8 +18,11 @@ An SPU ELF (machine 23) embedded in the executable is what an SPU thread
 group or a SPURS task runs: its executable segment is the program, compiled
 at the address its program header loads it to. An ELF that carries
 relocations (`.rela.text`) is a module some other SPU program loads where it
-chooses (FMOD's codecs and effects); its address is not in the file, so it is
-listed and not translated.
+chooses (FMOD's codecs and effects); its address is not in the file. Where the
+loader puts it is learnt from a run and given as a bias (local store = its
+address + the bias): the module is then translated there, every instruction a
+possible target, and the runtime runs it when its loader branches into a copy
+of it in local store (an overlay). Without a bias it is listed, not translated.
 """
 import re
 import struct
@@ -30,13 +33,14 @@ JOB_BASE = 0x1000          # where the runtime's job manager loads a job binary
 
 
 class Program:
-    def __init__(self, ea, size, base, name, elf=0):
+    def __init__(self, ea, size, base, name, elf=0, module=False):
         self.ea, self.size, self.base, self.name = ea, size, base, name
         self.elf = elf                      # the SPU ELF it comes from, or 0 for a job
+        self.module = module                # a relocatable module, placed at a bias
 
     @property
     def fname(self):
-        return f"spu_{self.ea:08X}"
+        return f"spu_{self.ea:08X}_{self.base:05X}" if self.module else f"spu_{self.ea:08X}"
 
 
 def find_jobs(img):
@@ -108,6 +112,20 @@ def find_elfs(img):
                             progs.append(Program(ea + off, filesz & ~3, vaddr, name, elf=ea))
             at = data.find(b"\x7fELF\x01\x02\x01", at + 1)
     return progs, modules
+
+
+def place_modules(img, modules, biases):
+    """The programs of relocatable modules, each one's executable segment at
+    its address plus every bias given."""
+    out = []
+    for ea, name in modules:
+        phoff, phnum = img.u32(ea + 28), img.u32(ea + 44) >> 16
+        for i in range(phnum):
+            p_type, off, vaddr, _, filesz, _, flags, _ = struct.unpack(">8I", img.read(ea + phoff + 32 * i, 32))
+            if p_type == 1 and flags & PF_X and filesz:
+                for bias in biases:
+                    out.append(Program(ea + off, filesz & ~3, vaddr + bias, name, elf=ea, module=True))
+    return out
 
 
 def _job_name(blob):
@@ -372,8 +390,9 @@ def dispatch_targets(img, prog):
     immediate load (`ila`, `il`, `ilhu` with `iohl`) or as a word of any of
     the ELF's loaded segments (jump tables, function pointers). A job
     relocates itself and computes its addresses, so a job keeps every
-    instruction as a target (None)."""
-    if not prog.elf:
+    instruction as a target (None), and so does a module, whose loader may
+    rewrite the addresses it holds."""
+    if not prog.elf or prog.module:
         return None
     lo, n = prog.base, prog.size
     out = set()

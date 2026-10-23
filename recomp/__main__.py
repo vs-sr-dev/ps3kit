@@ -76,7 +76,7 @@ class FnCtx:
         return f'ppu_unimplemented(c, 0x{t:08X}u, "call to unknown target");'
 
 
-def generate(img, out, per_file=20000, comments=False, log=print, spu_step=False):
+def generate(img, out, per_file=20000, comments=False, log=print, spu_step=False, spu_biases=()):
     t0 = time.time()
     prog = Program(img, log=log)
     entries = set(prog.entries)
@@ -137,7 +137,8 @@ def generate(img, out, per_file=20000, comments=False, log=print, spu_step=False
         f.write(f"extern const size_t g_ppu_nfuncs = {len(prog.entries)};\n")
 
     spu_elfs, spu_modules = S.find_elfs(img)
-    spu_progs = S.find_jobs(img) + spu_elfs
+    spu_overlays = S.place_modules(img, spu_modules, spu_biases)
+    spu_progs = S.find_jobs(img) + spu_elfs + spu_overlays
     spu_unsupported = {}
     for k, sp in enumerate(spu_progs):
         code, uns = S.translate(img, sp, comments, spu_step)
@@ -152,11 +153,13 @@ def generate(img, out, per_file=20000, comments=False, log=print, spu_step=False
         f.write('#include "spu.h"\n#include <cstddef>\n\n')
         for sp in spu_progs:
             f.write(f"uint32_t {sp.fname}(SPUContext& s, uint32_t pc);\n")
-        f.write("extern const SPUProgram g_spu_programs[] = {\n")
-        for sp in spu_progs:
-            f.write(f'    {{0x{sp.ea:08X}u, 0x{sp.size:X}u, 0x{sp.base:X}u, {sp.fname}, "{sp.name}", 0x{sp.elf:08X}u}},\n')
-        f.write("    {0, 0, 0, nullptr, nullptr, 0}\n};\n")
-        f.write(f"extern const size_t g_spu_nprograms = {len(spu_progs)};\n")
+        for table, count, progs in (("g_spu_programs", "g_spu_nprograms", [p for p in spu_progs if not p.module]),
+                                    ("g_spu_overlays", "g_spu_noverlays", spu_overlays)):
+            f.write(f"extern const SPUProgram {table}[] = {{\n")
+            for sp in progs:
+                f.write(f'    {{0x{sp.ea:08X}u, 0x{sp.size:X}u, 0x{sp.base:X}u, {sp.fname}, "{sp.name}", 0x{sp.elf:08X}u}},\n')
+            f.write("    {0, 0, 0, nullptr, nullptr, 0}\n};\n")
+            f.write(f"extern const size_t {count} = {len(progs)};\n")
 
     names = load_names()
     imports = img.imports()
@@ -204,9 +207,11 @@ endif()
         f"bad targets      {len(prog.bad_targets)}",
         f"imports          {len(imports)} libraries, {n_imp} functions",
         f"unsupported      {unsupported or 'none'}",
-        f"spu programs     {len(spu_progs)}: " + ", ".join(f"{p.name} {p.ea:08X}+{p.size:X}" for p in spu_progs),
+        f"spu programs     {len(spu_progs) - len(spu_overlays)}: "
+        + ", ".join(f"{p.name} {p.ea:08X}+{p.size:X}" for p in spu_progs if not p.module),
         f"spu unsupported  {spu_unsupported or 'none'}",
-        f"spu modules      {len(spu_modules)} relocatable, not translated: "
+        f"spu modules      {len(spu_modules)} relocatable, "
+        + (f"placed at bias {', '.join(f'{b:#x}' for b in spu_biases)}: " if spu_biases else "not translated: ")
         + ", ".join(f"{n} {ea:08X}" for ea, n in spu_modules),
         f"files            {len(files)}",
         f"time             {time.time() - t0:.1f} s",
@@ -228,8 +233,11 @@ def main():
     ap.add_argument("--comments", action="store_true", help="the guest address on every line")
     ap.add_argument("--spu-step", action="store_true",
                     help="SPU programs report every instruction under PS3KIT_SPU_TRACE=2 (slow)")
+    ap.add_argument("--spu-module-bias", type=lambda v: int(v, 0), action="append", default=[], metavar="N",
+                    help="translate the relocatable SPU modules at their addresses + N in local store, where a "
+                         "run showed their loader putting them (repeatable)")
     a = ap.parse_args()
-    generate(Image(a.image), a.out, a.per_file, a.comments, spu_step=a.spu_step)
+    generate(Image(a.image), a.out, a.per_file, a.comments, spu_step=a.spu_step, spu_biases=a.spu_module_bias)
 
 
 if __name__ == "__main__":

@@ -12,9 +12,11 @@
 // own reservations do not take it.
 #include "rt.h"
 #include "spu.h"
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <thread>
 
@@ -365,7 +367,37 @@ const SPUProgram* spu_program_of(uint32_t elf) {
     return nullptr;
 }
 
+// A module its loader has copied into local store, recompiled at the address
+// it sits at: the overlay whose image local store holds there.
+extern const SPUProgram g_spu_overlays[];
+extern const size_t g_spu_noverlays;
+
+static const SPUProgram* overlay_at(const SPUContext& s, uint32_t pc) {
+    const SPUProgram* near = nullptr;
+    for (size_t i = 0; i < g_spu_noverlays; ++i) {
+        const SPUProgram& o = g_spu_overlays[i];
+        if (pc - o.base >= o.size) continue;
+        if (std::memcmp(s.ls + o.base, g_mem + o.ea, o.size) == 0) return &o;
+        near = &o;
+    }
+    if (near) {
+        static std::atomic<bool> told{false};
+        if (!told.exchange(true))
+            rt_log("spu %u: branch to %05X, inside %s as recompiled at %05X, but local store holds other code there",
+                   s.id, pc, near->name, near->base);
+    }
+    return nullptr;
+}
+
 uint32_t spu_run(SPUContext& s, const SPUProgram* prog, uint32_t pc) {
-    while (pc != SPU_STOPPED && pc - prog->base < prog->size) pc = prog->fn(s, pc);
+    const SPUProgram* at = prog;
+    while (pc != SPU_STOPPED) {
+        if (pc - at->base >= at->size) {
+            if (pc - prog->base < prog->size) at = prog;
+            else if (const SPUProgram* o = overlay_at(s, pc)) at = o;
+            else break;
+        }
+        pc = at->fn(s, pc);
+    }
     return pc;
 }

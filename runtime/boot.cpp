@@ -60,6 +60,22 @@ static LONG WINAPI on_fault(EXCEPTION_POINTERS* ep) {
             std::fprintf(stderr, ", %s of host %p", kind, (void*)a);
     }
     std::fprintf(stderr, "\n");
+    // A fault in a library (the C runtime's memcpy, a driver) names the
+    // library, and the addresses of the executable's own code found on the
+    // stack above it: the first of them is, most often, its caller.
+    HMODULE mod = nullptr;
+    char name[MAX_PATH] = "?";
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           (LPCSTR)rip, &mod) && mod != (HMODULE)base) {
+        GetModuleFileNameA(mod, name, sizeof name);
+        std::fprintf(stderr, "ps3kit: in %s; the executable's code on the stack:", name);
+        auto* nt = (IMAGE_NT_HEADERS*)(base + ((IMAGE_DOS_HEADER*)base)->e_lfanew);
+        uintptr_t end = base + nt->OptionalHeader.SizeOfImage;
+        const uintptr_t* sp = (const uintptr_t*)ep->ContextRecord->Rsp;
+        for (int i = 0, n = 0; i < 512 && n < 8; ++i)
+            if (sp[i] > base && sp[i] < end) { std::fprintf(stderr, " %llX", (unsigned long long)(sp[i] - base)); ++n; }
+        std::fprintf(stderr, "\n");
+    }
     std::fflush(stderr);
     std::fflush(stdout);
     return EXCEPTION_CONTINUE_SEARCH;

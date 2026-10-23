@@ -237,6 +237,22 @@ void end_draw() {
     }
     d.textures = (uint32_t)texs.size();
 
+    // When this draw's new textures would take the renderer past its budget,
+    // its textures start again: said before the draw's record, never inside it.
+    uint64_t fresh = 0;
+    for (size_t i = 0; i < texs.size(); ++i) {
+        const RsxTexture& t = texs[i].t;
+        if (t.target || g_sent.count(t.key)) continue;
+        bool again = false;
+        for (size_t k = 0; k < i && !again; ++k) again = !texs[k].t.target && texs[k].t.key == t.key;
+        if (!again) fresh += t.bytes;
+    }
+    if (fresh && g_sent_bytes + fresh > (512ull << 20)) {
+        g_rec.push_back(RC_TEXFLUSH);
+        g_sent.clear();
+        g_sent_bytes = 0;
+    }
+
     flush_regs();
     g_rec.push_back(RC_DRAW);
     put(d);
@@ -248,11 +264,6 @@ void end_draw() {
         RsxTexture t = t0;
         if (t.target) { put(t); continue; }
         bool have = g_sent.count(t.key);
-        if (!have && g_sent_bytes + t.bytes > (512ull << 20)) {      // the renderer's textures start again
-            g_rec.push_back(RC_TEXFLUSH);
-            g_sent.clear();
-            g_sent_bytes = 0;
-        }
         if (have) t.bytes = 0;
         else { g_sent.insert(t.key); g_sent_bytes += t.bytes; }
         put(t);
