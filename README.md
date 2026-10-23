@@ -12,15 +12,16 @@ calls, libraries and GPU. ps3kit collects that shared part. It grows inside
 the ports: each piece is written because a game needed it, then kept free
 of that game's knowledge. Game formats and game fixes live in the ports.
 
-It lives inside its first port for now, and moves to its own repository when
-the second one starts.
+It grew inside its first port, PC-ROA, and moved to its own repository, with
+its history, when the second one started. Each port takes it back as a
+submodule at `ps3kit/`.
 
 ## Ports built on it
 
 | Port | Game | What it asked of ps3kit |
 |---|---|---|
-| PC-ROA (this repository) | Ragnarok Odyssey ACE (2013) | everything so far: the descriptor table, the imports, the PPU recompiler, the process start, threads, files, the command buffer to its first flip, the audio ports and their clock, the window, the RSX's draws: the publishers' logos; save data; cellSail and an MPEG-2 decoder: the first movie; the controller: the title screen, the main menu and character creation; the SPU recompiler and a job manager: CRI's sound, heard; cellFont with an OpenType/CFF reader and a rasterizer of its own: character creation's text; system events and the on-screen keyboard: the hero's name |
-| *next* | 3D Dot Game Heroes (2009) | the SPUs: 26 SPU programs on SPURS task sets and raw thread groups |
+| [pc-ragnarokodysseyace](https://github.com/vs-sr-dev/pc-ragnarokodysseyace) | Ragnarok Odyssey ACE (2013) | everything so far: the descriptor table, the imports, the PPU recompiler, the process start, threads, files, the command buffer to its first flip, the audio ports and their clock, the window, the RSX's draws: the publishers' logos; save data; cellSail and an MPEG-2 decoder: the first movie; the controller: the title screen, the main menu and character creation; the SPU recompiler and a job manager: CRI's sound, heard; cellFont with an OpenType/CFF reader and a rasterizer of its own: character creation's text; system events and the on-screen keyboard: the hero's name |
+| [pc-3ddotgameheroes](https://github.com/vs-sr-dev/pc-3ddotgameheroes) | 3D Dot Game Heroes (2009) | *in progress*: the SPUs, 26 SPU ELFs (Bullet's two SPURS tasks, FMOD's mixer and its 19 plugins, edgezlib, two water tasks) |
 
 ## Using it
 

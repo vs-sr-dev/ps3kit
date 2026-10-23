@@ -1,0 +1,5 @@
+# The repository stores LF and checks out LF, on every platform. The kit is
+# Python, C++ and Markdown, and none of them wants a line ending that
+# depends on who cloned it.
+* text=auto eol=lf
+
