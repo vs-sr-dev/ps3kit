@@ -136,7 +136,8 @@ def generate(img, out, per_file=20000, comments=False, log=print, spu_step=False
         f.write("};\n")
         f.write(f"extern const size_t g_ppu_nfuncs = {len(prog.entries)};\n")
 
-    spu_progs = S.find_jobs(img)
+    spu_elfs, spu_modules = S.find_elfs(img)
+    spu_progs = S.find_jobs(img) + spu_elfs
     spu_unsupported = {}
     for k, sp in enumerate(spu_progs):
         code, uns = S.translate(img, sp, comments, spu_step)
@@ -153,8 +154,8 @@ def generate(img, out, per_file=20000, comments=False, log=print, spu_step=False
             f.write(f"uint32_t {sp.fname}(SPUContext& s, uint32_t pc);\n")
         f.write("extern const SPUProgram g_spu_programs[] = {\n")
         for sp in spu_progs:
-            f.write(f'    {{0x{sp.ea:08X}u, 0x{sp.size:X}u, 0x{sp.base:X}u, {sp.fname}, "{sp.name}"}},\n')
-        f.write("    {0, 0, 0, nullptr, nullptr}\n};\n")
+            f.write(f'    {{0x{sp.ea:08X}u, 0x{sp.size:X}u, 0x{sp.base:X}u, {sp.fname}, "{sp.name}", 0x{sp.elf:08X}u}},\n')
+        f.write("    {0, 0, 0, nullptr, nullptr, 0}\n};\n")
         f.write(f"extern const size_t g_spu_nprograms = {len(spu_progs)};\n")
 
     names = load_names()
@@ -205,6 +206,8 @@ endif()
         f"unsupported      {unsupported or 'none'}",
         f"spu programs     {len(spu_progs)}: " + ", ".join(f"{p.name} {p.ea:08X}+{p.size:X}" for p in spu_progs),
         f"spu unsupported  {spu_unsupported or 'none'}",
+        f"spu modules      {len(spu_modules)} relocatable, not translated: "
+        + ", ".join(f"{n} {ea:08X}" for ea, n in spu_modules),
         f"files            {len(files)}",
         f"time             {time.time() - t0:.1f} s",
     ]

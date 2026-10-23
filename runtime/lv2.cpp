@@ -114,9 +114,19 @@ const char* lv2_name(int num) {
     return "?";
 }
 
+static const bool g_lv2_trace = std::getenv("PS3KIT_LV2") != nullptr;
+
 void ppu_syscall(PPUContext& c, uint32_t addr) {
     uint64_t n = c.r[11];
-    if (n < 1024 && g_sys[n].fn) { g_sys[n].fn(c); return; }
+    if (n < 1024 && g_sys[n].fn) {
+        if (!g_lv2_trace) { g_sys[n].fn(c); return; }
+        uint64_t a[4] = {c.r[3], c.r[4], c.r[5], c.r[6]};
+        g_sys[n].fn(c);
+        rt_log("lv2  %s(%llX, %llX, %llX, %llX) = %llX  at %08X  thread %X", lv2_name((int)n),
+               (unsigned long long)a[0], (unsigned long long)a[1], (unsigned long long)a[2], (unsigned long long)a[3],
+               (unsigned long long)c.r[3], addr, c.thread_id);
+        return;
+    }
     rt_log("STUB syscall %llu (%s) at %08X (%llX, %llX, %llX, %llX)", (unsigned long long)n,
            lv2_name((int)n), addr, (unsigned long long)c.r[3], (unsigned long long)c.r[4],
            (unsigned long long)c.r[5], (unsigned long long)c.r[6]);
@@ -136,6 +146,8 @@ LV2_SYSCALL(141, sys_timer_usleep) {
     host_sleep_until(end);
     c.r[3] = CELL_OK;
 }
+
+LV2_SYSCALL(147, sys_time_get_timebase_frequency) { c.r[3] = 79800000; }   // the Cell's timebase
 
 LV2_SYSCALL(145, sys_time_get_current_time) {        // (s64* sec, s64* nsec)
     using namespace std::chrono;

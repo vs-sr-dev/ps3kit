@@ -35,6 +35,19 @@ uint32_t g_labels;                                  // the semaphore area, 0x10 
 uint32_t g_callback;                                // the descriptor of cellGcmCallback
 uint32_t g_command_words = 0x400, g_segment_words = 0x100;
 
+// The I/O map: the effective address of each 1 MB page of the RSX's view of
+// main memory, 0 where nothing is mapped. _cellGcmInitBody maps the game's
+// I/O region from offset 0; cellGcmMapEaIoAddress maps more.
+constexpr uint32_t kIoPage = 0x100000u, kIoPages = 512;
+uint32_t g_io_map[kIoPages];
+std::map<uint32_t, std::pair<uint32_t, uint32_t>> g_io_maps;   // ea -> (offset, size), for unmapping
+std::mutex g_io_mx;
+// The local report area, out of the part of local memory the game is not
+// given; main-memory reports are at I/O offset 0x0E000000 (libgcm's).
+constexpr uint32_t kLocalReports = mm::VIDEO + 0x0FE00000u, kMainReports = 0x0E000000u;
+uint32_t g_report_dma = 0x66626660u;                // NV4097_SET_CONTEXT_DMA_REPORT: local
+std::atomic<uint64_t> g_last_flip_us{0};
+
 std::atomic<uint32_t> g_flip_status{0};             // CELL_GCM_DISPLAY_FLIP_STATUS_DONE
 std::atomic<uint64_t> g_vblank_count{0};
 std::atomic<uint32_t> g_flips{0};
@@ -48,6 +61,13 @@ std::condition_variable_any g_vblank_cv;
 
 // PS3KIT_RSX_TRACE=N: every method of the Nth frame (the methods before flip N), with its argument
 const uint32_t g_trace_frame = std::getenv("PS3KIT_RSX_TRACE") ? (uint32_t)std::atoi(std::getenv("PS3KIT_RSX_TRACE")) : 0;
+
+uint32_t io_ea(uint32_t off) {
+    uint32_t page = off / kIoPage;
+    if (page >= kIoPages) return 0;
+    uint32_t ea = g_io_map[page];
+    return ea ? ea + off % kIoPage : 0;
+}
 
 uint32_t put() { return ld32(g_control); }
 uint32_t get() { return ld32(g_control + 4); }
@@ -106,6 +126,7 @@ void flip(uint32_t id) {
         rt_log("rsx: flip %u to buffer %u (offset %X, %ux%u, pitch %X)", n, id, d.offset, d.width, d.height, d.pitch);
     }
     const Display& d = g_display[id & 7];
+    g_last_flip_us = (uint64_t)ppu_timebase() / 80;
     rsxcap_flip(RsxFlip{id, d.offset, d.pitch, d.width, d.height});
     if (uint32_t h = g_flip_handler) ppu_intr_post(h, 1);
     if (uint32_t h = g_resc_flip_handler) ppu_intr_post(h, 1);
@@ -129,6 +150,17 @@ void method(uint32_t m, uint32_t arg, uint32_t& sem406e, uint32_t& sem4097) {
         return;
     case 0x1D74: st32(g_labels + sem4097, arg); return;             // NV4097_TEXTURE_READ_SEMAPHORE_RELEASE
     case 0xFEAC: flip(arg); return;                                 // GCM_FLIP_COMMAND
+    case 0x01A8: g_report_dma = arg; return;                        // NV4097_SET_CONTEXT_DMA_REPORT
+    case 0x1800: {                                                  // NV4097_GET_REPORT: type << 24 | offset
+        uint32_t off = arg & 0xFFFFFF;
+        uint32_t a = g_report_dma == 0xBAD68000u ? io_ea(kMainReports + off) : kLocalReports + off;
+        if (!a) return;
+        st64(a, (uint64_t)ppu_timebase() * 1000 / 80);             // the timer, in nanoseconds
+        st32(a + 8, (arg >> 24) == 1 ? 0x00100000u : 0);           // ZPASS_PIXEL_CNT: everything passes
+        st32(a + 12, 0);
+        return;
+    }
+    case 0x17C8: return;                                            // NV4097_CLEAR_REPORT_VALUE
     default: break;
     }
     rsxcap_method(m, arg);
@@ -143,7 +175,7 @@ void* rsx_main(void*) {
             std::this_thread::sleep_for(std::chrono::microseconds(50));
             continue;
         }
-        uint32_t cmd = ld32(g_io_addr + g);
+        uint32_t cmd = ld32(io_ea(g));
         if ((cmd & 0xE0000003u) == 0x20000000u) { st32(g_control + 4, cmd & 0x1FFFFFFCu); continue; }  // old jump
         if ((cmd & 3) == 1) { st32(g_control + 4, cmd & ~3u); continue; }                            // jump
         if ((cmd & 3) == 2) {                                                                         // call
@@ -155,7 +187,7 @@ void* rsx_main(void*) {
         uint32_t count = (cmd >> 18) & 0x7FF, m = cmd & 0xFFFC;
         bool inc = !(cmd & 0x40000000u);
         for (uint32_t i = 0; i < count; ++i)
-            method(inc ? m + 4 * i : m, ld32(g_io_addr + g + 4 + 4 * i), sem406e, sem4097);
+            method(inc ? m + 4 * i : m, ld32(io_ea(g + 4 + 4 * i)), sem406e, sem4097);
         st32(g_control + 4, g + 4 + 4 * count);
     }
     return nullptr;
@@ -196,6 +228,10 @@ PS3_HLE(_cellGcmInitBody) {              // (CellGcmContextData** context, cmd s
     g_io_size = arg_u32(c, 2);
     g_io_addr = arg_u32(c, 3);
     g_segments = g_cmd_size / kSegment ? g_cmd_size / kSegment : 1;
+    {
+        std::lock_guard<std::mutex> lk(g_io_mx);
+        for (uint32_t k = 0; k < g_io_size / kIoPage && k < kIoPages; ++k) g_io_map[k] = g_io_addr + k * kIoPage;
+    }
     g_control = hle_alloc(0x1000, 0x1000) + 0x40;
     g_labels = hle_alloc(0x1000, 0x1000);
     st32(g_control, 0x1000);                                        // put
@@ -209,7 +245,6 @@ PS3_HLE(_cellGcmInitBody) {              // (CellGcmContextData** context, cmd s
     st32(pctx, g_ctx);
     rt_log("gcm: io %08X+%X, command area %X (%u segments), local %08X+%X, control %08X",
            g_io_addr, g_io_size, g_cmd_size, g_segments, mm::VIDEO, kLocalSize, g_control);
-    rsxcap_io(g_io_addr, g_io_size);
     start(rsx_main);
     start(vblank_main);
     c.r[3] = CELL_OK;
@@ -238,10 +273,65 @@ PS3_HLE(cellGcmGetConfiguration) {       // (CellGcmConfig*)
 PS3_HLE(cellGcmAddressToOffset) {        // (address, u32* offset)
     uint32_t a = arg_u32(c, 0), out = arg_u32(c, 1);
     if (a - mm::VIDEO < kLocalSize) st32(out, a - mm::VIDEO);
-    else if (a - g_io_addr < g_io_size) st32(out, a - g_io_addr);
-    else { c.r[3] = kFailure; return; }
+    else {
+        std::lock_guard<std::mutex> lk(g_io_mx);
+        for (uint32_t k = 0; k < kIoPages; ++k)
+            if (g_io_map[k] && a - g_io_map[k] < kIoPage) { st32(out, k * kIoPage + (a - g_io_map[k])); c.r[3] = CELL_OK; return; }
+        c.r[3] = kFailure;
+        return;
+    }
     c.r[3] = CELL_OK;
 }
+
+PS3_HLE(cellGcmMapEaIoAddress) {         // (ea, io offset, size): 1 MB pages of main memory into the I/O map
+    uint32_t ea = arg_u32(c, 0), io = arg_u32(c, 1), size = arg_u32(c, 2);
+    if (!size || ea % kIoPage || io % kIoPage || size % kIoPage || (io + size) / kIoPage > kIoPages) {
+        c.r[3] = kFailure;
+        return;
+    }
+    std::lock_guard<std::mutex> lk(g_io_mx);
+    for (uint32_t k = 0; k < size / kIoPage; ++k)
+        if (g_io_map[io / kIoPage + k]) { c.r[3] = kFailure; return; }
+    for (uint32_t k = 0; k < size / kIoPage; ++k) g_io_map[io / kIoPage + k] = ea + k * kIoPage;
+    g_io_maps[ea] = {io, size};
+    rt_log("gcm: main memory %08X+%X mapped at I/O offset %08X", ea, size, io);
+    c.r[3] = CELL_OK;
+}
+
+PS3_HLE(cellGcmUnmapEaIoAddress) {       // (ea)
+    std::lock_guard<std::mutex> lk(g_io_mx);
+    auto it = g_io_maps.find(arg_u32(c, 0));
+    if (it == g_io_maps.end()) { c.r[3] = kFailure; return; }
+    for (uint32_t k = 0; k < it->second.second / kIoPage; ++k) g_io_map[it->second.first / kIoPage + k] = 0;
+    g_io_maps.erase(it);
+    c.r[3] = CELL_OK;
+}
+
+PS3_HLE(cellGcmIoOffsetToAddress) {      // (io offset, u32* ea)
+    uint32_t ea;
+    {
+        std::lock_guard<std::mutex> lk(g_io_mx);
+        ea = io_ea(arg_u32(c, 0));
+    }
+    if (!ea) { c.r[3] = kFailure; return; }
+    st32(arg_u32(c, 1), ea);
+    c.r[3] = CELL_OK;
+}
+
+PS3_HLE(cellGcmGetReportDataAddressLocation) {   // (index, location): a CellGcmReportData*
+    uint32_t index = arg_u32(c, 0);
+    c.r[3] = arg_u32(c, 1) == 1 ? io_ea(kMainReports + 16 * index) : kLocalReports + 16 * index;
+}
+
+PS3_HLE(cellGcmGetReport) {              // (type, index): a local report's value
+    uint32_t type = arg_u32(c, 0), index = arg_u32(c, 1);
+    c.r[3] = type < 1 || type > 5 ? 0xFFFFFFFFu : ld32(kLocalReports + 16 * index + 8);
+}
+
+PS3_HLE(cellGcmGetLabelAddress) { c.r[3] = g_labels + 0x10 * (arg_u32(c, 0) & 0xFF); }
+PS3_HLE(cellGcmGetLastFlipTime) { c.r[3] = g_last_flip_us.load(); }
+PS3_HLE(cellGcmSetFlipStatus) { g_flip_status = 0; }
+PS3_HLE(cellGcmInitDefaultFifoMode) { c.r[3] = CELL_OK; }   // (mode): the default FIFO is the only one
 
 PS3_HLE(cellGcmGetTiledPitchSize) {
     static const uint32_t pitches[] = {
@@ -353,3 +443,8 @@ PS3_HLE(cellRescSetConvertAndFlip) {     // (context, idx)
 PS3_HLE(cellRescResetFlipStatus) { g_flip_status = 1; }
 PS3_HLE(cellRescSetFlipHandler) { g_resc_flip_handler = arg_u32(c, 0); }
 PS3_HLE(cellRescSetVBlankHandler) { g_resc_vblank_handler = arg_u32(c, 0); }
+
+uint32_t gcm_io_ea(uint32_t offset) {
+    std::lock_guard<std::mutex> lk(g_io_mx);
+    return io_ea(offset);
+}

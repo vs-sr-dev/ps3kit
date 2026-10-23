@@ -236,6 +236,24 @@ static inline void vmx_vpkuwum(VR& d, const VR& a, const VR& b) {
 static inline void vmx_vpkuhum(VR& d, const VR& a, const VR& b) {
     VR r; for (int i = 0; i < 8; ++i) { r.b[i] = (uint8_t)vmx_half(a, i); r.b[i + 8] = (uint8_t)vmx_half(b, i); } d = r;
 }
+// Signed words to signed halfwords, saturated. VSCR[SAT] is not set: like the
+// FPSCR's exception bits, the saturation flag is not kept.
+static inline int16_t vmx_sat16(int32_t x) { return (int16_t)std::min(32767, std::max(-32768, x)); }
+static inline void vmx_vpkswss(VR& d, const VR& a, const VR& b) {
+    VR r; for (int i = 0; i < 4; ++i) {
+        vmx_sethalf(r, i, (uint16_t)vmx_sat16((int32_t)vmx_word(a, i)));
+        vmx_sethalf(r, i + 4, (uint16_t)vmx_sat16((int32_t)vmx_word(b, i)));
+    } d = r;
+}
+// Signed halfword products, the even (0, 2, 4, 6) or odd elements, as words.
+static inline void vmx_vmulesh(VR& d, const VR& a, const VR& b) {
+    VR r; for (int i = 0; i < 4; ++i)
+        vmx_setword(r, i, (uint32_t)((int32_t)(int16_t)vmx_half(a, 2 * i) * (int16_t)vmx_half(b, 2 * i))); d = r;
+}
+static inline void vmx_vmulosh(VR& d, const VR& a, const VR& b) {
+    VR r; for (int i = 0; i < 4; ++i)
+        vmx_setword(r, i, (uint32_t)((int32_t)(int16_t)vmx_half(a, 2 * i + 1) * (int16_t)vmx_half(b, 2 * i + 1))); d = r;
+}
 static inline void vmx_vupkhsh(VR& d, const VR& b) { VR r; for (int i = 0; i < 4; ++i) vmx_setword(r, i, (uint32_t)(int32_t)(int16_t)vmx_half(b, i)); d = r; }
 static inline void vmx_vupklsh(VR& d, const VR& b) { VR r; for (int i = 0; i < 4; ++i) vmx_setword(r, i, (uint32_t)(int32_t)(int16_t)vmx_half(b, i + 4)); d = r; }
 static inline void vmx_vupkhsb(VR& d, const VR& b) { VR r; for (int i = 0; i < 8; ++i) vmx_sethalf(r, i, (uint16_t)(int16_t)(int8_t)b.b[i]); d = r; }

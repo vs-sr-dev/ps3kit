@@ -13,7 +13,6 @@
 
 namespace {
 uint32_t reg[0x4000];                   // by method / 4
-uint32_t g_io_addr = 0, g_io_size = 0;
 std::vector<uint8_t> g_rec;
 std::vector<uint32_t> g_pending;        // method, value pairs not yet in the record
 uint32_t g_prim = 0;
@@ -86,7 +85,7 @@ bool readable(uint32_t a, uint32_t n) {
 }
 
 // An RSX offset to a guest address: location 0 is local memory, 1 main memory through the I/O map.
-uint32_t address(uint32_t location, uint32_t offset) { return location ? g_io_addr + offset : mm::VIDEO + offset; }
+uint32_t address(uint32_t location, uint32_t offset) { return location ? gcm_io_ea(offset) : mm::VIDEO + offset; }
 
 uint64_t hash(const uint8_t* p, size_t n, uint64_t h = 0x9E3779B97F4A7C15ull) {
     size_t i = 0;
@@ -188,7 +187,13 @@ void end_draw() {
             if (lit && !read4(a + 16 * ++pc)) break;
             if (end) { ok = true; break; }
         }
-        if (!ok) { report_once("fragment program without an end, or outside guest memory"); fp.clear(); }
+        if (!ok) {
+            char w[96];
+            std::snprintf(w, sizeof w, "fragment program at %08X (%s %X) without an end, or outside guest memory", a,
+                          (sp & 3) == 2 ? "main" : "local", sp & ~3u);
+            report_once(w);
+            fp.clear();
+        }
     }
     d.fp_words = (uint32_t)fp.size();
     if (d.fp_words && d.vertices) register_targets(true, true);    // the renderer draws it, so makes them
@@ -256,10 +261,27 @@ void end_draw() {
 }
 }  // namespace
 
-void rsxcap_io(uint32_t io_addr, uint32_t io_size) { g_io_addr = io_addr; g_io_size = io_size; }
+
+// NV308A, an image from the CPU, its words in the FIFO, written into the
+// NV3062 surface. libgcm binds NV3062 to subchannel 3 and NV308A to 5 (the
+// methods 0x6000 and 0xA000 up), and that binding is taken here, not read
+// from the objects the subchannels were set to. This is how a game puts
+// small things into local memory through the command buffer, its fragment
+// programs among them (cellGcmSetInlineTransfer).
+void inline_image(uint32_t m, uint32_t v) {
+    uint32_t i = (m - 0xA400) >> 2;
+    uint32_t point = reg[0xA304 >> 2], x = point & 0xFFFF, y = point >> 16;
+    uint32_t fmt = reg[0x6300 >> 2], pitch = reg[0x6304 >> 2] >> 16, off = reg[0x630C >> 2];
+    uint32_t bpp = fmt == 4 ? 2 : 4;            // R5G6B5; A8R8G8B8 and Y32
+    uint32_t a = address(reg[0x6188 >> 2] == 0xFEED0001u, off + y * pitch + x * bpp + 4 * i);
+    if (!readable(a, 4)) { report_once("inline image outside guest memory"); return; }
+    if (bpp == 2) v = v << 16 | v >> 16;         // two pixels a word, the first in the low half
+    st32(a, v);
+}
 
 void rsxcap_method(uint32_t m, uint32_t v) {
     reg[m >> 2] = v;
+    if (m >= 0xA400 && m < 0xA800) { inline_image(m, v); return; }   // NV308A_COLOR
     switch (m) {
     case 0x1808:                                                    // NV4097_SET_BEGIN_END
         if (v) { g_prim = v; g_indexed = false; g_ranges.clear(); }

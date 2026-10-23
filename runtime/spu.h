@@ -22,6 +22,8 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <mutex>
+#include <string>
 
 typedef uint8_t  spu_u8x16 __attribute__((vector_size(16)));
 typedef int8_t   spu_s8x16 __attribute__((vector_size(16)));
@@ -57,18 +59,48 @@ struct SPUContext {
     uint64_t dec_base;                   // the decrementer: written value and time
     uint32_t dec_value;
     uint32_t id;                         // for reports
+    uint32_t event_mask;                 // SPU_WrEventMask
+    struct SPUHost* host;                // who runs it, or null (a SPURS job)
+};
+
+// What runs an SPU program and answers for the system around it: an SPU
+// thread's lv2 (sputhread.cpp), a SPURS task's kernel (spurs.cpp). A channel
+// the host does not take is answered by spu.cpp as for a job.
+struct SPUHost {
+    virtual ~SPUHost() = default;
+    virtual bool rdch(SPUContext&, uint32_t /*ch*/, uint32_t& /*v*/) { return false; }
+    virtual bool rchcnt(SPUContext&, uint32_t /*ch*/, uint32_t& /*n*/) { return false; }
+    virtual bool wrch(SPUContext&, uint32_t /*ch*/, uint32_t /*v*/) { return false; }
+    // `stop` and `stopd`: true ends the program, false goes on at pc + 4
+    virtual bool stop(SPUContext&, uint32_t pc, uint32_t code) = 0;
 };
 
 // A recompiled program: its executable image, where it was compiled to sit in
-// local store, and its code.
+// local store, and its code; for one from an SPU ELF, the ELF's address.
 typedef uint32_t (*SPUFunc)(SPUContext&, uint32_t);
-struct SPUProgram { uint32_t ea, size, base; SPUFunc fn; const char* name; };
+struct SPUProgram { uint32_t ea, size, base; SPUFunc fn; const char* name; uint32_t elf; };
+// what a program returns when a stop has ended it: no local-store address
+constexpr uint32_t SPU_STOPPED = 0xFFFFFFFFu;
 
 // ---- services provided by the runtime ---------------------------------------------
 uint32_t spu_rdch(SPUContext& s, uint32_t ch);
 uint32_t spu_rchcnt(SPUContext& s, uint32_t ch);
 void     spu_wrch(SPUContext& s, uint32_t ch, uint32_t v);
-[[noreturn]] void spu_stop(SPUContext& s, uint32_t pc, uint32_t code);
+// true: the program ends. With no host, a stop is reported and ends the process.
+bool     spu_stop(SPUContext& s, uint32_t pc, uint32_t code);
+// The lock under which the SPUs' GETLLAR/PUTLLC compare and write lines: the
+// runtime's own writes into memory an SPU reserves (SPURS's structures) take it.
+std::mutex& spu_atomic_mutex();
+// What spu_printf would print, from the block its event names (in local store).
+std::string spu_printf_text(const SPUContext& s, uint32_t block);
+// An indirect branch to an address inside the program that the recompiler
+// did not take for a possible target: reported; the program ends.
+uint32_t spu_missed(SPUContext& s, uint32_t pc);
+// The recompiled program of an SPU ELF (by the ELF's address), or null.
+const SPUProgram* spu_program_of(uint32_t elf);
+// Run from pc until the program stops (SPU_STOPPED) or branches out of
+// `prog` (that address is returned).
+uint32_t spu_run(SPUContext& s, const SPUProgram* prog, uint32_t pc);
 [[noreturn]] void spu_halt(SPUContext& s, uint32_t pc);
 [[noreturn]] void spu_illegal(SPUContext& s, uint32_t pc, uint32_t word);
 // PS3KIT_SPU_TRACE=1: every indirect branch (a return, a computed jump) is reported

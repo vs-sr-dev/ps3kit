@@ -13,7 +13,16 @@ Programs are found by what marks them. A SPURS job binary built with the
 SDK's job runtime carries "JOBCRT Ver" at +0x30, its image size at +0x3C,
 and its entry at +0x10; the code is position-independent and relocates
 itself, so any base serves as long as the runtime loads it there.
+
+An SPU ELF (machine 23) embedded in the executable is what an SPU thread
+group or a SPURS task runs: its executable segment is the program, compiled
+at the address its program header loads it to. An ELF that carries
+relocations (`.rela.text`) is a module some other SPU program loads where it
+chooses (FMOD's codecs and effects); its address is not in the file, so it is
+listed and not translated.
 """
+import re
+import struct
 from ..spu import decode, _sext
 
 JOBCRT_MAGIC = b"JOBCRT Ver"
@@ -21,8 +30,9 @@ JOB_BASE = 0x1000          # where the runtime's job manager loads a job binary
 
 
 class Program:
-    def __init__(self, ea, size, base, name):
+    def __init__(self, ea, size, base, name, elf=0):
         self.ea, self.size, self.base, self.name = ea, size, base, name
+        self.elf = elf                      # the SPU ELF it comes from, or 0 for a job
 
     @property
     def fname(self):
@@ -46,6 +56,58 @@ def find_jobs(img):
                     out.append(Program(ea, size, JOB_BASE, name))
             at = data.find(JOBCRT_MAGIC, at + 1)
     return out
+
+
+SPU_MACHINE = 23
+PF_X = 1
+
+
+def _spu_name(blob, shoff, shnum, shstrndx):
+    """(the ELF's `.note.spu_name`, whether it has relocation sections)."""
+    if not shnum or shoff + shnum * 40 > len(blob):
+        return None, False
+    secs = [struct.unpack_from(">10I", blob, shoff + 40 * i) for i in range(shnum)]
+    stro = secs[shstrndx][4] if shstrndx < shnum else 0
+
+    def name(off):
+        end = blob.find(b"\0", stro + off)
+        return blob[stro + off:end].decode("latin1") if end >= 0 else ""
+    note, rela = None, False
+    for sh in secs:
+        n = name(sh[0])
+        rela |= n.startswith(".rela")
+        if n == ".note.spu_name" and sh[5] >= 12:
+            namesz, descsz = struct.unpack_from(">II", blob, sh[4])
+            d = sh[4] + 12 + ((namesz + 3) & ~3)
+            note = blob[d:d + descsz].split(b"\0")[0].decode("latin1") or None
+    return note, rela
+
+
+def find_elfs(img):
+    """(programs, relocatable modules): every SPU ELF in the image, by its
+    header. A program is the ELF's executable segment, at its load address;
+    a module is (ea, name) and is not translated."""
+    progs, modules = [], []
+    for seg in img.segments:
+        data = seg.data
+        at = data.find(b"\x7fELF\x01\x02\x01")
+        while at >= 0:
+            if len(data) - at >= 52 and struct.unpack_from(">H", data, at + 18)[0] == SPU_MACHINE:
+                ea = seg.vaddr + at
+                phoff, shoff = struct.unpack_from(">II", data, at + 28)
+                phnum, shnum, shstrndx = struct.unpack_from(">HxxHH", data, at + 44)
+                blob = data[at:]
+                note, rela = _spu_name(blob, shoff, shnum, shstrndx)
+                name = note or f"spuelf_{ea:08X}"
+                if rela:
+                    modules.append((ea, name))
+                else:
+                    for i in range(phnum):
+                        p_type, off, vaddr, _, filesz, _, flags, _ = struct.unpack_from(">8I", blob, phoff + 32 * i)
+                        if p_type == 1 and flags & PF_X and filesz:
+                            progs.append(Program(ea + off, filesz & ~3, vaddr, name, elf=ea))
+            at = data.find(b"\x7fELF\x01\x02\x01", at + 1)
+    return progs, modules
 
 
 def _job_name(blob):
@@ -159,7 +221,7 @@ def emit(ins, off, prog):
     if op == "illegal":
         return [f"spu_illegal(s, 0x{pc:05X}u, 0x{ins.word:08X}u);"]
     if op in ("stop", "stopd"):
-        return [f"spu_stop(s, 0x{pc:05X}u, 0x{f.get('code', 0):X}u);"]
+        return [f"if (spu_stop(s, 0x{pc:05X}u, 0x{f.get('code', 0):X}u)) return SPU_STOPPED;"]
 
     # loads and stores
     if op == "lqd":
@@ -299,18 +361,57 @@ def _target(ins, pc):
     return target(ins, pc)
 
 
+_LINKING = {"brsl", "brasl", "bisl", "bisled"}
+_GOTO = re.compile(r"goto L_([0-9A-F]{5});")
+
+
+def dispatch_targets(img, prog):
+    """The addresses an indirect branch of an SPU ELF's program can reach, as
+    offsets into it: its entry, every return address (after a branch that
+    links), and every code address the program holds as a constant, in an
+    immediate load (`ila`, `il`, `ilhu` with `iohl`) or as a word of any of
+    the ELF's loaded segments (jump tables, function pointers). A job
+    relocates itself and computes its addresses, so a job keeps every
+    instruction as a target (None)."""
+    if not prog.elf:
+        return None
+    lo, n = prog.base, prog.size
+    out = set()
+
+    def add(a):
+        if 0 <= a - lo < n and a % 4 == 0:
+            out.add(a - lo)
+    add(img.u32(prog.elf + 24))
+    hi_part = {}
+    for off in range(0, n, 4):
+        ins = decode(img.u32(prog.ea + off))
+        op, f = ins.op, ins.f
+        if op in _LINKING:
+            add(lo + off + 4)
+        elif op == "ila":
+            add(f["i18"])
+        elif op == "il":
+            add(_sext(f["i16"], 16) & 0xFFFFFFFF)
+        elif op == "ilhu":
+            hi_part[f["rt"]] = f["i16"] << 16
+        elif op == "iohl" and f["rt"] in hi_part:
+            add(hi_part.pop(f["rt"]) | f["i16"])
+    phoff, phnum = img.u32(prog.elf + 28), img.u32(prog.elf + 44) >> 16
+    for i in range(phnum):
+        ph = prog.elf + phoff + 32 * i
+        if img.u32(ph) != 1:
+            continue
+        off, filesz = img.u32(ph + 4), img.u32(ph + 16)
+        for k in range(0, filesz & ~3, 4):
+            add(img.u32(prog.elf + off + k))
+    return out
+
+
 def translate(img, prog, comments=False, step=False):
     """The C++ function for one program, and the operations it could not translate."""
     unsupported = {}
-    lines = [f"// {prog.name}: {prog.size:#x} bytes from {prog.ea:#010x}, at local store {prog.base:#x}",
-             f"uint32_t {prog.fname}(SPUContext& s, uint32_t pc) {{",
-             "dispatch:",
-             "    SPU_DISPATCH(s, pc);",
-             f"    switch ((pc - 0x{prog.base:X}u) >> 2) {{"]
-    for off in range(0, prog.size, 4):
-        lines.append(f"    case {off >> 2}: goto L_{off:05X};")
-    lines.append("    default: return pc;")
-    lines.append("    }")
+    targets = dispatch_targets(img, prog)
+    body, used = [], set()
     for off in range(0, prog.size, 4):
         w = img.u32(prog.ea + off)
         ins = decode(w)
@@ -319,10 +420,31 @@ def translate(img, prog, comments=False, step=False):
         except Unsupported as ex:
             unsupported[str(ex)] = unsupported.get(str(ex), 0) + 1
             code = [f"spu_illegal(s, 0x{prog.base + off:05X}u, 0x{w:08X}u);"]
-        label = f"L_{off:05X}:"
-        if comments:
-            label += f"  // {ins.op}"
-        lines.append(label)
+        for x in code:
+            for m in _GOTO.finditer(x):
+                used.add(int(m.group(1), 16))
+        body.append((off, ins, code))
+    cases = range(0, prog.size, 4) if targets is None else sorted(targets)
+    used.update(cases)
+    lines = [f"// {prog.name}: {prog.size:#x} bytes from {prog.ea:#010x}, at local store {prog.base:#x}"
+             + ("" if targets is None else f", {len(targets)} indirect-branch targets"),
+             f"uint32_t {prog.fname}(SPUContext& s, uint32_t pc) {{",
+             "dispatch:",
+             "    SPU_DISPATCH(s, pc);",
+             f"    switch ((pc - 0x{prog.base:X}u) >> 2) {{"]
+    for off in cases:
+        lines.append(f"    case {off >> 2}: goto L_{off:05X};")
+    if targets is None:
+        lines.append("    default: return pc;")
+    else:
+        lines.append(f"    default: return pc - 0x{prog.base:X}u < 0x{prog.size:X}u ? spu_missed(s, pc) : pc;")
+    lines.append("    }")
+    for off, ins, code in body:
+        if off in used:
+            label = f"L_{off:05X}:"
+            if comments:
+                label += f"  // {ins.op}"
+            lines.append(label)
         if step:
             lines.append(f"    SPU_STEP(s, 0x{prog.base + off:05X}u);")
         lines.extend("    " + x for x in code)

@@ -73,7 +73,8 @@ void video_submit(std::vector<uint8_t>& rec, int flips);
 void pad_host_poll();
 
 // rsxcap.cpp, on the FIFO thread
-void rsxcap_io(uint32_t io_addr, uint32_t io_size);
+// An I/O offset (location main) to its effective address through the I/O map; 0 if unmapped.
+uint32_t gcm_io_ea(uint32_t offset);
 void rsxcap_method(uint32_t m, uint32_t v);     // every method the FIFO thread does not execute itself
 void rsxcap_flip(const RsxFlip& f);             // ends the record and hands it over
 

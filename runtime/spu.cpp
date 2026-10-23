@@ -16,6 +16,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <mutex>
+#include <thread>
 
 namespace {
 enum : uint32_t {
@@ -142,6 +143,31 @@ void command(SPUContext& s, uint32_t cmd) {
     }
 }
 
+constexpr uint32_t SPU_EVENT_LR = 0x400;     // the lock line reservation was lost
+
+// The pending events: only the lost reservation is raised, when the line
+// GETLLAR saw no longer holds what it saw. Waiting, the line is polled.
+uint32_t event_stat(SPUContext& s, bool wait) {
+    if (!(s.event_mask & SPU_EVENT_LR) || s.raddr == ~0u) {
+        if (wait && s.event_mask) {
+            static std::once_flag once;
+            std::call_once(once, [&] { rt_log("spu %u: waits for events %X, none of which is raised", s.id, s.event_mask); });
+        }
+        return 0;
+    }
+    for (;;) {
+        {
+            std::lock_guard<std::mutex> lk(g_atomic);
+            if (std::memcmp(g_mem + s.raddr, s.rdata, 128) != 0) {
+                if (wait) s.raddr = ~0u;
+                return SPU_EVENT_LR;
+            }
+        }
+        if (!wait) return 0;
+        std::this_thread::sleep_for(std::chrono::microseconds(20));
+    }
+}
+
 uint64_t now_ticks() {                                        // the decrementer's 79.8 MHz
     using namespace std::chrono;
     return (uint64_t)duration_cast<nanoseconds>(steady_clock::now().time_since_epoch()).count() * 798 / 10000;
@@ -149,6 +175,8 @@ uint64_t now_ticks() {                                        // the decrementer
 }  // namespace
 
 uint32_t spu_rdch(SPUContext& s, uint32_t ch) {
+    uint32_t hv;
+    if (s.host && s.host->rdch(s, ch, hv)) return hv;
     switch (ch) {
     case MFC_RdTagStat:
         s.tag_stat = s.tag_mask;                              // every group is complete
@@ -160,7 +188,11 @@ uint32_t spu_rdch(SPUContext& s, uint32_t ch) {
         return s.dec_value - (uint32_t)(now_ticks() - s.dec_base);
     case MFC_RdListStallStat:
         return 0;
-    case SPU_RdEventMask: case SPU_RdEventStat: case SPU_RdMachStat: case SPU_RdSRR0:
+    case SPU_RdEventMask:
+        return s.event_mask;
+    case SPU_RdEventStat:
+        return event_stat(s, true);
+    case SPU_RdMachStat: case SPU_RdSRR0:
         return 0;
     case SPU_RdInMbox:
         rt_log("spu %u: reads its inbound mailbox; nothing is sent", s.id);
@@ -172,6 +204,8 @@ uint32_t spu_rdch(SPUContext& s, uint32_t ch) {
 }
 
 uint32_t spu_rchcnt(SPUContext& s, uint32_t ch) {
+    uint32_t hn;
+    if (s.host && s.host->rchcnt(s, ch, hn)) return hn;
     switch (ch) {
     case MFC_RdTagStat: return 1;
     case MFC_RdAtomicStat: return s.atomic_pending ? 1 : 0;
@@ -179,11 +213,13 @@ uint32_t spu_rchcnt(SPUContext& s, uint32_t ch) {
     case SPU_WrOutMbox: case SPU_WrOutIntrMbox: return 1;
     case SPU_RdInMbox: return 0;
     case SPU_RdDec: return 1;
+    case SPU_RdEventStat: return event_stat(s, false) ? 1 : 0;
     default: return 1;
     }
 }
 
 void spu_wrch(SPUContext& s, uint32_t ch, uint32_t v) {
+    if (s.host && s.host->wrch(s, ch, v)) return;
     switch (ch) {
     case MFC_LSA: s.mfc_lsa = v; return;
     case MFC_EAH: s.mfc_eah = v; return;
@@ -195,7 +231,8 @@ void spu_wrch(SPUContext& s, uint32_t ch, uint32_t v) {
     case MFC_WrTagUpdate: s.tag_update = v; return;
     case MFC_WrListStallAck: return;
     case SPU_WrDec: s.dec_value = v; s.dec_base = now_ticks(); return;
-    case SPU_WrEventMask: case SPU_WrEventAck: case SPU_WrSRR0: return;
+    case SPU_WrEventMask: s.event_mask = v; return;
+    case SPU_WrEventAck: case SPU_WrSRR0: return;
     case SPU_WrOutMbox: case SPU_WrOutIntrMbox:
         rt_log("spu %u: mailbox%s %08X", s.id, ch == SPU_WrOutIntrMbox ? " (interrupt)" : "", v);
         return;
@@ -233,7 +270,8 @@ void dump(SPUContext& s) {
 
 }  // namespace
 
-void spu_stop(SPUContext& s, uint32_t pc, uint32_t code) {
+bool spu_stop(SPUContext& s, uint32_t pc, uint32_t code) {
+    if (s.host) return s.host->stop(s, pc, code);
     rt_log("spu %u: stop %X at %05X", s.id, code, pc);
     dump(s);
     std::fflush(stderr);
@@ -252,4 +290,82 @@ void spu_illegal(SPUContext& s, uint32_t pc, uint32_t word) {
     dump(s);
     std::fflush(stderr);
     std::exit(1);
+}
+
+std::mutex& spu_atomic_mutex() { return g_atomic; }
+
+// spu_printf's block: the format's local-store address, then each argument,
+// one quadword apiece in its preferred slot (a double or a long long in the
+// first doubleword), as the SPU's variadic calls save their registers.
+std::string spu_printf_text(const SPUContext& s, uint32_t block) {
+    auto word = [&](uint32_t a) {
+        a &= SPU_LS_MASK & ~3u;
+        return (uint32_t)s.ls[a] << 24 | s.ls[a + 1] << 16 | s.ls[a + 2] << 8 | s.ls[a + 3];
+    };
+    auto dword = [&](uint32_t a) { return (uint64_t)word(a) << 32 | word(a + 4); };
+    auto str = [&](uint32_t a) {
+        std::string out;
+        for (a &= SPU_LS_MASK; a < SPU_LS_SIZE && s.ls[a] && out.size() < 512; ++a) out += (char)s.ls[a];
+        return out;
+    };
+    std::string fmt = str(word(block)), out;
+    uint32_t arg = block + 16;
+    for (size_t i = 0; i < fmt.size(); ++i) {
+        if (fmt[i] != '%' || i + 1 == fmt.size()) { out += fmt[i]; continue; }
+        size_t j = i + 1;
+        while (j < fmt.size() && std::strchr("-+ #0123456789.lhz", fmt[j])) ++j;
+        if (j == fmt.size()) break;
+        std::string spec = fmt.substr(i, j - i + 1);
+        bool wide = spec.find("ll") != std::string::npos;
+        char conv = fmt[j], buf[600];
+        std::string clean = spec;
+        for (const char* m : {"ll", "l", "h", "z"})
+            for (size_t k; (k = clean.find(m)) != std::string::npos;) clean.erase(k, std::strlen(m));
+        switch (conv) {
+        case '%': out += '%'; i = j; continue;
+        case 's': std::snprintf(buf, sizeof buf, clean.c_str(), str(word(arg)).c_str()); break;
+        case 'f': case 'g': case 'e': {
+            uint64_t d = dword(arg);
+            double v;
+            std::memcpy(&v, &d, 8);
+            std::snprintf(buf, sizeof buf, clean.c_str(), v);
+            break;
+        }
+        case 'c': std::snprintf(buf, sizeof buf, clean.c_str(), (int)word(arg)); break;
+        default: {
+            std::string f = clean;
+            f.insert(f.size() - 1, "ll");
+            uint64_t v = wide ? dword(arg) : word(arg);
+            if (!wide && (conv == 'd' || conv == 'i')) v = (uint64_t)(int64_t)(int32_t)v;
+            std::snprintf(buf, sizeof buf, f.c_str(), (unsigned long long)v);
+            break;
+        }
+        }
+        out += buf;
+        arg += 16;
+        i = j;
+    }
+    while (!out.empty() && (out.back() == '\n' || out.back() == '\r')) out.pop_back();
+    return out;
+}
+
+uint32_t spu_missed(SPUContext& s, uint32_t pc) {
+    rt_log("spu %u: indirect branch to %05X, which the recompiler did not take for a target ($0 %05X)", s.id, pc,
+           s.r[0].u32[3]);
+    dump(s);
+    return SPU_STOPPED;
+}
+
+extern const SPUProgram g_spu_programs[];
+extern const size_t g_spu_nprograms;
+
+const SPUProgram* spu_program_of(uint32_t elf) {
+    for (size_t i = 0; i < g_spu_nprograms; ++i)
+        if (g_spu_programs[i].elf == elf) return &g_spu_programs[i];
+    return nullptr;
+}
+
+uint32_t spu_run(SPUContext& s, const SPUProgram* prog, uint32_t pc) {
+    while (pc != SPU_STOPPED && pc - prog->base < prog->size) pc = prog->fn(s, pc);
+    return pc;
 }

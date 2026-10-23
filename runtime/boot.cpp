@@ -2,11 +2,15 @@
 // memory, every import bound, the primary thread's stack and TLS, and a call
 // to the entry descriptor with the registers _start expects.
 //
-//     ps3boot GAME.elf [--bdvd DISC] [--hdd0 DIR] [--no-video] [--quit-after SECONDS]
+//     ps3boot GAME.elf [--bdvd DISC] [--hdd0 DIR] [--hdd1 DIR] [--flash DIR] [--no-video] [--quit-after SECONDS]
 //                      [--dump DIR [--dump-every N]]
 //
 // DISC is the player's extracted disc, the folder that holds PS3_GAME;
-// DIR is where /dev_hdd0 lives (game data, saves), created if missing.
+// DIR is where /dev_hdd0 lives (game data, saves), created if missing;
+// --hdd1 is the root of the system caches (/dev_hdd1, one directory a cache
+// id, "hdd1" if not given); --flash is /dev_flash, the system's own files
+// (read-only), which a game's
+// middleware may read (FMOD reads its MP3 decoder from there).
 // The window and the renderer take the host's main thread and the game runs
 // on its own; --no-video runs the game alone. --dump writes every Nth shown
 // frame (60 by default) as a PNG.
@@ -28,7 +32,7 @@
 #endif
 
 void tls_init(PPUContext& c, uint32_t image, uint32_t filesz, uint32_t memsz);
-extern std::string g_dev_bdvd, g_dev_hdd0;
+extern std::string g_dev_bdvd, g_dev_hdd0, g_dev_flash, g_dev_hdd1_root;
 
 #ifdef _WIN32
 // A host fault, reported with what makes it findable: the host instruction
@@ -81,6 +85,8 @@ int main(int argc, char** argv) {
         if (!v) { std::fprintf(stderr, "ps3boot: %s needs a value\n", k.c_str()); return 2; }
         if (k == "--bdvd") g_dev_bdvd = v;
         else if (k == "--hdd0") g_dev_hdd0 = v;
+        else if (k == "--flash") g_dev_flash = v;
+        else if (k == "--hdd1") g_dev_hdd1_root = v;
         else if (k == "--quit-after") vo.quit_after = std::atof(v);
         else if (k == "--dump") vo.dump_dir = v;
         else if (k == "--dump-every") vo.dump_every = std::max(1, std::atoi(v));
@@ -91,8 +97,8 @@ int main(int argc, char** argv) {
     std::error_code ec;
     std::filesystem::create_directories(g_dev_hdd0 + "/game", ec);
     std::filesystem::create_directories(g_dev_hdd0 + "/home/00000001/savedata", ec);
-    rt_log("ps3kit: /dev_bdvd -> %s, /dev_hdd0 -> %s", g_dev_bdvd.empty() ? "(none)" : g_dev_bdvd.c_str(),
-           g_dev_hdd0.c_str());
+    rt_log("ps3kit: /dev_bdvd -> %s, /dev_hdd0 -> %s, /dev_flash -> %s", g_dev_bdvd.empty() ? "(none)" : g_dev_bdvd.c_str(),
+           g_dev_hdd0.c_str(), g_dev_flash.empty() ? "(none)" : g_dev_flash.c_str());
 #ifdef _WIN32
     AddVectoredExceptionHandler(1, on_fault);
     timeBeginPeriod(1);                  // the system's clocks (vblank, audio) sleep in milliseconds

@@ -71,6 +71,7 @@ void ppu_thread_register_main(PPUContext& c, const char* name, int prio) {
     t->id = c.thread_id;
     t->ctx = &c;
     t->name = name;
+    t->prio = prio;
     std::lock_guard<std::mutex> lk(g_mx);
     g_threads[t->id] = t;
 }

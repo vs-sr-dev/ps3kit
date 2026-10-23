@@ -19,7 +19,7 @@
 
 namespace fs = std::filesystem;
 
-std::string g_dev_bdvd, g_dev_hdd0;
+std::string g_dev_bdvd, g_dev_hdd0, g_dev_flash, g_dev_hdd1_root = "hdd1", g_dev_hdd1;
 
 namespace {
 constexpr uint32_t ENOENT_ = 0x80010006u, EISDIR_ = 0x80010012u, EEXIST_ = 0x80010014u,
@@ -52,6 +52,8 @@ std::string host_path(const std::string& p) {
     if (!(h = under("/dev_bdvd", g_dev_bdvd, "")).empty()) return h;
     if (!(h = under("/app_home", g_dev_bdvd, "/PS3_GAME/USRDIR")).empty()) return h;
     if (!(h = under("/dev_hdd0", g_dev_hdd0, "")).empty()) return h;
+    if (!(h = under("/dev_flash", g_dev_flash, "")).empty()) return h;
+    if (!(h = under("/dev_hdd1", g_dev_hdd1, "")).empty()) return h;
     return "";
 }
 
@@ -78,6 +80,7 @@ uint32_t do_open(const std::string& guest, uint32_t flags, uint32_t& fd) {
     else if ((flags & O_TRUNC_) || !exists) mode = acc == O_RDWR_ ? "w+b" : "wb";
     else mode = "r+b";
     if (acc != 0 && h.rfind(g_dev_bdvd, 0) == 0 && !g_dev_bdvd.empty()) return EACCES_;   // the disc is read-only
+    if (acc != 0 && h.rfind(g_dev_flash, 0) == 0 && !g_dev_flash.empty()) return EACCES_;  // and so is the flash
     FILE* f = std::fopen(h.c_str(), mode);
     if (!f) return EIO_;
     std::lock_guard<std::mutex> lk(g_mx);
@@ -342,3 +345,41 @@ LV2_SYSCALL(813, sys_fs_rmdir) {
 
 // The host path of a guest path, for the system libraries that open files themselves.
 std::string fs_host_path(const std::string& guest) { return host_path(guest); }
+
+// (path, u32* block size, u64* block count): the free space cellGameBootCheck
+// reports, 40,000,000 KB, in 4 KB blocks, whatever the path and the host.
+PS3_HLE(cellFsGetFreeSize) {
+    if (arg_u32(c, 1)) st32(arg_u32(c, 1), 4096);
+    if (arg_u32(c, 2)) st64(arg_u32(c, 2), 40000000ull * 1024 / 4096);
+    c.r[3] = CELL_OK;
+}
+
+// ---- the system cache: /dev_hdd1 ------------------------------------------------------------
+// cellSysCacheMount mounts /dev_hdd1 on a host directory of the cache's own,
+// <hdd1 root>/<cache id>; a cache found there again is relayed (kept), any
+// other is cleared, as the system keeps one game cache at a time. An empty
+// id always clears.
+// CellSysCacheParam: char cacheId[32], char getCachePath[1055], u32 reserved.
+PS3_HLE(cellSysCacheMount) {
+    uint32_t p = arg_u32(c, 0);
+    if (!p) { c.r[3] = 0x8002BC03u; return; }                       // CELL_SYSCACHE_ERROR_PARAM
+    std::string id = mem_cstr(p, 32);
+    static const char path[] = "/dev_hdd1";
+    mem_write(p + 32, path, sizeof path);
+    std::error_code ec;
+    std::string dir = g_dev_hdd1_root + "/" + (id.empty() ? std::string("_") : id);
+    bool relay = !id.empty() && g_dev_hdd1 == dir && std::filesystem::is_directory(dir, ec);
+    if (!relay && !id.empty() && g_dev_hdd1.empty() && std::filesystem::is_directory(dir, ec)) relay = true;
+    if (!relay) std::filesystem::remove_all(dir, ec);
+    std::filesystem::create_directories(dir, ec);
+    g_dev_hdd1 = dir;
+    rt_log("fs: system cache \"%s\" at %s, %s", id.c_str(), dir.c_str(), relay ? "relayed" : "cleared");
+    c.r[3] = relay ? 1 : 0;                                         // CELL_SYSCACHE_RET_OK_RELAYED / _CLEARED
+}
+
+PS3_HLE(cellSysCacheClear) {
+    if (g_dev_hdd1.empty()) { c.r[3] = 0x8002BC04u; return; }      // CELL_SYSCACHE_ERROR_NOTMOUNTED
+    std::error_code ec;
+    for (auto& e : std::filesystem::directory_iterator(g_dev_hdd1, ec)) std::filesystem::remove_all(e.path(), ec);
+    c.r[3] = CELL_OK;
+}

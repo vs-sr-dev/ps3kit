@@ -3,6 +3,7 @@
 // system calls to C++.
 #pragma once
 #include "ppu.h"
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <memory>
@@ -97,6 +98,8 @@ PPUContext* ppu_context_new(uint32_t stacksize, const char* name);
 void     ppu_intr_post(uint32_t desc, uint64_t arg);
 uint32_t tls_new_block();                           // a thread's TLS block; r13 = it + 0x7000
 bool     lv2_event_queue_push(uint32_t queue, uint64_t source, uint64_t d1, uint64_t d2, uint64_t d3);
+uint32_t lv2_event_queue_new(uint32_t size);
+uint32_t lv2_event_queue_pop(uint32_t queue, uint64_t ev[4], bool wait, const std::atomic<bool>* stop = nullptr);
 
 // ---- where the time goes (prof.cpp, PS3KIT_PROF=1) ------------------------------------------
 enum ProfSlot { PROF_FIFO_IDLE, PROF_FIFO_SEMA, PROF_FIFO_CAPTURE, PROF_FIFO_VBLANK, PROF_FIFO_SUBMIT,

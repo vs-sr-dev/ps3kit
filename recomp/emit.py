@@ -115,7 +115,8 @@ _VMX3 = {"vaddfp", "vsubfp", "vmaxfp", "vminfp", "vand", "vandc", "vor", "vxor",
          "vslw", "vsrw", "vsraw", "vslh", "vsrh", "vsrah", "vslb", "vsrb", "vsrab",
          "vmrghw", "vmrglw", "vmrghh", "vmrglh", "vmrghb", "vmrglb",
          "vmaxsw", "vminsw", "vmaxuw", "vminuw", "vmaxsh", "vminsh",
-         "vpkuwum", "vpkuhum", "vavgub", "vrlw", "vslo", "vsro", "vsl", "vsr"}
+         "vpkuwum", "vpkuhum", "vavgub", "vrlw", "vslo", "vsro", "vsl", "vsr",
+         "vpkswss", "vmulesh", "vmulosh"}
 _VMX2 = {"vrefp", "vrsqrtefp", "vrfiz", "vrfin", "vrfip", "vrfim", "vexptefp", "vlogefp",
          "vupkhsh", "vupklsh", "vupkhsb", "vupklsb"}
 _VMXCMP = {"vcmpequw", "vcmpequh", "vcmpequb", "vcmpeqfp", "vcmpgefp", "vcmpgtfp",

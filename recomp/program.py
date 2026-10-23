@@ -148,25 +148,12 @@ class Program:
                     continue
                 back = [(a - 4 * k, self.decode(a - 4 * k)) for k in range(1, 13)
                         if a - 4 * k >= u.start]
-                lwzx = next((i for _, i in back if i.op in ("lwzx", "lwax")), None)
-                if lwzx is None:
+                load = self._entry_load(back)
+                if load is None:
                     continue
-                base_reg = None
-                toc_off = None
-                for _, i in back:
-                    if i.op == "lwz" and i.f["A"] == 2 and i.f["D"] in (lwzx.f["A"], lwzx.f["B"]):
-                        base_reg, toc_off = i.f["D"], i.f["d"]
-                        break
+                base_reg, toc_off, scaled = load
                 relative = any(i.op == "add" and base_reg in (i.f["A"], i.f["B"]) for _, i in back)
-                bound = None
-                for k in range(1, 40):
-                    b = a - 4 * k
-                    if b < u.start:
-                        break
-                    i = self.decode(b)
-                    if i.op == "cmpli" and i.f["L"] == 0:
-                        bound = i.f["imm"] + 1
-                        break
+                bound = self._bound(a, u, self._index_regs(back, scaled))
                 targets = None
                 if base_reg is not None and u.toc is not None:
                     try:
@@ -178,6 +165,98 @@ class Program:
                     self.tables[a] = targets
                 else:
                     self.unresolved_tables.append(a)
+
+    @staticmethod
+    def _entry_load(back):
+        """(table base register, its TOC offset, the scaled index registers)
+        for the load of a switch table's entry, or None if `back` (the words
+        before a `bctr`, nearest first) loads none. Two shapes: `lwzx`/`lwax`
+        of the scaled index off the base, and the unoptimised one, `add` of
+        the two and then `lwz 0(sum)`. The base is a `lwz` off r2."""
+        def toc_base(regs, after):
+            for _, i in back[after:]:
+                if i.op == "lwz" and i.f["A"] == 2 and i.f["D"] in regs:
+                    return i.f["D"], i.f["d"]
+            return None, None
+        for k, (_, i) in enumerate(back):
+            if i.op in ("lwzx", "lwax"):
+                pair = {i.f["A"], i.f["B"]}
+                base, off = toc_base(pair, k + 1)
+                return base, off, pair - {base}
+            if (i.op == "lwz" and i.f["d"] == 0 and i.f["A"] != 1
+                    and any(x.op == "add" and i.f["D"] in (x.f["A"], x.f["B"])
+                            for _, x in back[:k])):       # an offset, added to a base
+                for j in range(k + 1, len(back)):
+                    add = back[j][1]
+                    if add.op == "add" and add.f["D"] == i.f["A"]:
+                        pair = {add.f["A"], add.f["B"]}
+                        base, off = toc_base(pair, j + 1)
+                        if base is not None:
+                            return base, off, pair - {base}
+                        break
+        return None
+
+    def _index_regs(self, back, scaled):
+        """The registers that hold the switch index: the one the entry load
+        scales, and what it was scaled and zero-extended from (`rldic`,
+        `rldicr`, `rlwinm`, `rldicl`, `mr`)."""
+        regs = set(scaled)
+        for _, i in back:                       # nearest first, in this block
+            if self._block_end(i.word, i):
+                break
+            if i.op in ("rldic", "rldicr", "rlwinm", "rldicl") and i.f["A"] in regs:
+                regs.add(i.f["S"])
+            elif i.op == "or" and i.f["S"] == i.f["B"] and i.f["A"] in regs:
+                regs.add(i.f["S"])
+        return regs
+
+    def _block_end(self, w, i):
+        """Does this word end the straight-line block that runs into the next
+        one? An unconditional branch, a return, a `bctr`, or data."""
+        return (w in _TERMINATORS or (w >> 26 == 18 and not w & 1)
+                or (i.op in ("bclr", "bcctr") and i.f["BO"] & 0x14 == 0x14)
+                or i.op == "illegal")
+
+    def _cmp_back(self, a, lo, regs):
+        """(bound, block start) walking back from `a` inside its own block: the
+        `cmplwi` on one of `regs` (any `cmplwi` when `regs` is None). A compare
+        of a register masked or zero-extended from one of them counts too
+        (`clrlwi r0, r9, 24; cmplwi r0, 45`, the index tested in a copy)."""
+        pending = {}                            # compared register -> bound
+        for k in range(1, 40):
+            b = a - 4 * k
+            if b < lo:
+                return None, None
+            w = self.word(b)
+            i = ppu.decode(w)
+            if self._block_end(w, i):
+                return None, b + 4
+            if i.op == "cmpli" and i.f["L"] == 0:
+                if regs is None or i.f["A"] in regs:
+                    return i.f["imm"] + 1, None
+                pending.setdefault(i.f["A"], i.f["imm"] + 1)
+            elif (regs is not None and i.op in ("rlwinm", "rldicl") and i.f["SH"] == 0
+                  and i.f["A"] in pending and i.f["S"] in regs):
+                return pending[i.f["A"]], None
+        return None, None
+
+    def _bound(self, a, u, regs):
+        """How many entries the table at this `bctr` has: the bound the index is
+        checked against before it. The check is in the `bctr`'s own block, or,
+        when that block is reached by a branch (the compiler moves dispatch
+        blocks after a return), before a branch to it. None if not found."""
+        bound, start = self._cmp_back(a, u.start, regs)
+        if bound is not None:
+            return bound
+        if start is not None:
+            for b in range(u.start, u.end, 4):
+                w = self.word(b)
+                if w >> 26 in (16, 18) and not w & 1 and self._rel(w, b) == start:
+                    got, _ = self._cmp_back(b + 4, u.start, regs)
+                    if got is not None:
+                        return got
+        bound, _ = self._cmp_back(a, u.start, None)
+        return bound
 
     def _read_table(self, table, relative, bound, u):
         out = []

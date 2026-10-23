@@ -17,6 +17,7 @@
 // The output (cellAudioOut, a cellSysutil function) is what a PS3 on a
 // television reports: HDMI, two-channel linear PCM at 48 kHz.
 #include "rt.h"
+#include <map>
 #include <SDL3/SDL.h>
 #include <chrono>
 #include <cstdio>
@@ -112,6 +113,15 @@ void mix_block(const AudioPort& p, const uint8_t* block, float* mix) {
 
 // The audio system's period: every started port's current block is consumed
 // and cleared, and its read index moves on.
+// Notification queues: an event (CELL_AUDIO_EVENT_MIX) each period to every
+// queue a key was registered for. The keys are the runtime's, from the base
+// RPCS3 uses; the event's source is a value of the runtime's too.
+std::map<uint64_t, uint32_t> g_notify_keys;        // key -> queue, for every queue the runtime made
+std::map<uint64_t, uint32_t> g_notify;             // the registered ones
+uint64_t g_next_key = 0x80004D494F323221ull;
+const bool g_audio_trace = std::getenv("PS3KIT_AUDIO") != nullptr;    // the notifications, every second
+uint32_t g_sent = 0, g_dropped = 0;
+
 void clock_main() {
     using namespace std::chrono;
     const auto t0 = steady_clock::now();
@@ -133,6 +143,18 @@ void clock_main() {
                 std::memset(block, 0, block_bytes(p));
                 p.pos = (p.pos + 1) % p.blocks;
                 st64(p.index, p.pos);
+            }
+        }
+        {
+            std::lock_guard<std::mutex> lk(g_mx);
+            if (g_init)
+                for (auto& [key, q] : g_notify) {
+                    bool sent = lv2_event_queue_push(q, key, 0, 0, 0);   // CELL_AUDIO_EVENT_MIX
+                    if (g_audio_trace) { ++(sent ? g_sent : g_dropped); }
+                }
+            if (g_audio_trace && n % 188 == 0) {
+                rt_log("audio: %u notifications sent, %u dropped (queue full) in the last second", g_sent, g_dropped);
+                g_sent = g_dropped = 0;
             }
         }
         for (float& v : mix) v = std::fmin(std::fmax(v, -1.0f), 1.0f);
@@ -297,4 +319,41 @@ PS3_HLE(cellAudioOutConfigure) {         // (audio out, CellAudioOutConfiguratio
     g_downmixer = ld32(p + 12);
     rt_log("audio: output %u channels, downmixer %u", g_out_channels, g_downmixer);
     c.r[3] = CELL_OK;
+}
+
+// (audio out, coding type, fs, option): how many channels the output takes in
+// that coding at that rate, 0 when none. The output is two-channel linear PCM
+// at 48 kHz (fs bit 0x04), so that is the one combination that answers 2.
+PS3_HLE(cellAudioOutGetSoundAvailability) {
+    uint32_t out = arg_u32(c, 0), type = arg_u32(c, 1), fs = arg_u32(c, 2);
+    if (out != 0) { c.r[3] = 0x8002B245u; return; }
+    c.r[3] = type == 0 && (fs & 0x04) ? 2 : 0;
+}
+
+PS3_HLE(cellAudioOutSetCopyControl) {    // (audio out, control): there is no copy protection to set
+    c.r[3] = CELL_OK;
+}
+
+PS3_HLE(cellAudioCreateNotifyEventQueue) {   // (u32* id, u64* key)
+    std::lock_guard<std::mutex> lk(g_mx);
+    uint32_t q = lv2_event_queue_new(32);
+    uint64_t key = g_next_key++;
+    g_notify_keys[key] = q;
+    st32(arg_u32(c, 0), q);
+    st64(arg_u32(c, 1), key);
+    c.r[3] = CELL_OK;
+}
+
+PS3_HLE(cellAudioSetNotifyEventQueue) {      // (u64 key)
+    std::lock_guard<std::mutex> lk(g_mx);
+    if (!g_init) { c.r[3] = kErrNotInit; return; }
+    auto it = g_notify_keys.find(arg_u64(c, 0));
+    if (it == g_notify_keys.end()) { c.r[3] = kErrParam; return; }
+    g_notify[it->first] = it->second;
+    c.r[3] = CELL_OK;
+}
+
+PS3_HLE(cellAudioRemoveNotifyEventQueue) {   // (u64 key)
+    std::lock_guard<std::mutex> lk(g_mx);
+    c.r[3] = g_notify.erase(arg_u64(c, 0)) ? CELL_OK : kErrParam;
 }

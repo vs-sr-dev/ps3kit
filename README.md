@@ -21,7 +21,7 @@ submodule at `ps3kit/`.
 | Port | Game | What it asked of ps3kit |
 |---|---|---|
 | [pc-ragnarokodysseyace](https://github.com/vs-sr-dev/pc-ragnarokodysseyace) | Ragnarok Odyssey ACE (2013) | everything so far: the descriptor table, the imports, the PPU recompiler, the process start, threads, files, the command buffer to its first flip, the audio ports and their clock, the window, the RSX's draws: the publishers' logos; save data; cellSail and an MPEG-2 decoder: the first movie; the controller: the title screen, the main menu and character creation; the SPU recompiler and a job manager: CRI's sound, heard; cellFont with an OpenType/CFF reader and a rasterizer of its own: character creation's text; system events and the on-screen keyboard: the hero's name |
-| [pc-3ddotgameheroes](https://github.com/vs-sr-dev/pc-3ddotgameheroes) | 3D Dot Game Heroes (2009) | *in progress*: the SPUs, 26 SPU ELFs (Bullet's two SPURS tasks, FMOD's mixer and its 19 plugins, edgezlib, two water tasks) |
+| [pc-3ddotgameheroes](https://github.com/vs-sr-dev/pc-3ddotgameheroes) | 3D Dot Game Heroes (2009) | the SPUs: SPU ELFs recompiled at their load address, lv2 SPU thread groups (FMOD's mixer), SPURS task sets, tasks and event flags on a kernel of the runtime's own, `spu_printf`; switch tables the compiler did not optimise; the I/O map, reports and inline image transfers (the fragment programs); audio notifications; `/dev_flash` and `/dev_hdd1`: the publishers' and the middleware's logos |
 
 ## Using it
 
@@ -43,7 +43,10 @@ ninja -C build/recomp-build
 build/recomp-build/ps3boot GAME.elf --bdvd DISC --hdd0 DIR   # DISC holds PS3_GAME
 ```
 
-`ps3boot` opens a window and runs the game behind it; `--no-video` runs the
+`ps3boot` opens a window and runs the game behind it. `--hdd1 DIR` is the
+root of the system caches (`/dev_hdd1`, `hdd1` if not given) and `--flash
+DIR` is `/dev_flash`, read-only, for a game whose middleware reads the
+system's own files there. `--no-video` runs the
 game alone, `--quit-after SECONDS` ends the run, and `--dump DIR` writes
 every 60th shown frame as a PNG (`--dump-every N` for another interval).
 
@@ -72,7 +75,13 @@ take, `PS3KIT_SPU_DMA=1` every DMA transfer an SPU program makes (`=2` with
 its words), `PS3KIT_SPU_TRACE=1` every indirect branch in SPU code, and
 `PS3KIT_SPU_TRACE=2` every instruction, once the code has been generated with
 `python -m ps3kit.recomp ... --spu-step`. `PS3KIT_AUDIODUMP=FILE.wav` writes
-what the audio output plays.
+what the audio output plays, and `PS3KIT_AUDIO=1` how many notifications the
+audio clock sent and dropped each second.
+
+`PS3KIT_LV2=1` reports every lv2 call that has an implementation, with its
+arguments and result (the stubs are always reported). `PS3KIT_SPURS=1`
+reports each SPURS task's start, system calls, events and exit, and the raw
+block behind each `spu_printf` it makes.
 
 `PS3KIT_PROF=1` reports, every 30 flips, where the wall-clock time went:
 the RSX thread idle, on semaphores, capturing draws, waiting for the vblank
@@ -145,17 +154,18 @@ position-independent and relocate themselves.
 
 | Layer | Question it answers | Now | Next |
 |---|---|---|---|
-| 1. Recognise | What is in this executable? | `elf`: segments, process parameters, TLS, the descriptor table, imports by name; SPURS job binaries by their job-runtime header | SPU ELFs, task sets, the middleware it links |
+| 1. Recognise | What is in this executable? | `elf`: segments, process parameters, TLS, the descriptor table, imports by name; SPURS job binaries by their job-runtime header; SPU ELFs by their header and `.note.spu_name` (`recomp.spu.find_elfs`) | task sets, the middleware it links |
 | 2. Read code | What does this function do? | `ppu`: the PPU decoder, disassembly, census; `spu`: the same for the SPU | cross-references through the TOC |
-| 3. Recompile | The code as C++ | `recomp`: discovery, switch tables, the whole user-mode PPU set and the VMX operations games use; each SPU program whole, every SPU instruction but `bisled` and the double compares by magnitude | SPU ELFs and task sets |
-| 4. Run | The PS3 under the game | `runtime`: memory map, dispatch, loader, imports, lv2 calls, the process start; PPU threads, lightweight and lv2 synchronisation, event queues; the file system (cellFs and sys_fs); cellGame; cellGcmSys and cellResc with a FIFO consumer, labels, flips and a 59.94 Hz vblank; the renderer (SDL3, OpenGL 4.5): a window, render targets on the host GPU, clears, draws with vertex and fragment programs translated to GLSL, textures, blending, flips; video out; cellAudio and the audio output, with the 48 kHz clock that consumes the ports and plays them through SDL3; SPURS job queues with a job manager running recompiled SPU programs: the SPU's channels, its DMA and atomic unit; save data (Auto, ListAuto, Fixed) with PARAM.SFO; cellSail playing PAMF through the runtime's own MPEG-2 decoder; cellPad from the host's gamepad and keyboard; system events raised through cellSysutilCheckCallback; cellOskDialog typed on the host's keyboard; cellFont over the runtime's own OpenType reader (CFF outlines, name- or CID-keyed) and coverage rasterizer | the rest of the 3D engine's state (fog, clip planes, two-sided colour, point sprites), TrueType outlines and the system's font sets, the list save dialogs, SPURS task sets and SPU thread groups |
+| 3. Recompile | The code as C++ | `recomp`: discovery, switch tables, the whole user-mode PPU set and the VMX operations games use; each SPU program whole, every SPU instruction but `bisled` and the double compares by magnitude: SPURS jobs, and SPU ELFs at their load address, dispatching only where an indirect branch can land | SPU modules that another SPU program relocates (FMOD's codecs and effects) |
+| 4. Run | The PS3 under the game | `runtime`: memory map, dispatch, loader, imports, lv2 calls, the process start; PPU threads, lightweight and lv2 synchronisation, event queues; the file system (cellFs and sys_fs); cellGame; cellGcmSys and cellResc with a FIFO consumer, labels, reports, the I/O map, flips and a 59.94 Hz vblank; the renderer (SDL3, OpenGL 4.5): a window, render targets on the host GPU, clears, draws with vertex and fragment programs translated to GLSL, textures, blending, flips; video out; cellAudio and the audio output, with the 48 kHz clock that consumes the ports and plays them through SDL3; SPURS job queues with a job manager running recompiled SPU programs: the SPU's channels, its DMA and atomic unit, the lock-line reservation event; lv2 SPU images and thread groups, the threads' mailboxes, event ports and local stores; SPURS instances, task sets, tasks, exit codes and event flags, on a kernel of the runtime's own; save data (Auto, ListAuto, Fixed) with PARAM.SFO; cellSail playing PAMF through the runtime's own MPEG-2 decoder; cellPad from the host's gamepad and keyboard; system events raised through cellSysutilCheckCallback; cellOskDialog typed on the host's keyboard; cellFont over the runtime's own OpenType reader (CFF outlines, name- or CID-keyed) and coverage rasterizer | the rest of the 3D engine's state (fog, clip planes, two-sided colour, point sprites), TrueType outlines and the system's font sets, the list save dialogs, SPURS queues, lock-free queues and barriers |
 
 ## Known approximations
 
 Declared here as they are made, so that the list is the cost:
 
 - `fres`, `frsqrte` and the VMX estimates return exact values, not the
-  hardware's estimates; FPSCR exception bits are not kept.
+  hardware's estimates; FPSCR exception bits are not kept, and
+  the saturating VMX operations never set VSCR[SAT].
 - The word divides write zero into the undefined high word.
 - `lwarx`/`stwcx.` is a compare-and-swap against the value the reservation
   saw: a store of the same value in between goes unnoticed.
@@ -319,5 +329,49 @@ Declared here as they are made, so that the list is the cost:
 - The system's font sets are not installed. `cellFontOpenFontset` succeeds,
   and every glyph asked of such a font is refused with `NO_SUPPORT_GLYPH` and
   reported once per character.
+- SPU ELFs are translated for the address their program header loads them
+  at, and their dispatch has a case only where an indirect branch can land:
+  the entry, every return address, and every code address the program holds
+  as a constant, in an immediate load or as a word of its loaded segments.
+  An indirect branch anywhere else inside the program is reported
+  (`spu_missed`) and ends it. (A case for every instruction had clang
+  compiling Bullet's 43,448-instruction task for more than ten minutes; the
+  targets are 588.) Jobs keep a case per instruction.
+- lv2 SPU threads run on host threads, from the moment their group starts.
+  A terminated group's threads end at their next channel access or stop;
+  `sys_spu_thread_group_suspend` is reported and not done. Only the user
+  event ports (`SYS_SPU_THREAD_EVENT_USER`) connect.
+- SPURS has a kernel of the runtime's own that does not schedule: every task
+  runs on a host thread of its own from its creation, whatever the number of
+  SPUs the instance was given. The taskset policy module's context and the
+  kernel's are written where a task's library reads them, with the layouts
+  RPCS3 documents. A task waiting for a signal polls its taskset's
+  `signalled` bit every 50 microseconds; a task's context is never saved, so
+  the save areas and LS patterns are only checked by the task itself. The
+  workload flag syscall is reported and answers 0. An event a task sends goes
+  to the queue attached to that SPU port of its instance; `spu_printf` (port
+  1, when no queue is attached) is printed by the runtime.
+  `_cellSpursTaskAttributeInitialize`'s signature, (attr, revision, sdk, elf,
+  saveConfig*, argument*), is read off a call site.
+- SPURS queues, lock-free queues and barriers answer `CELL_OK` and do
+  nothing: their layouts are what the tasks' own code reads, and are not read
+  yet.
+- The SPU's events: only the lock-line reservation lost (`0x400`) is raised,
+  by polling the reserved line every 20 microseconds while the SPU waits.
+- Inline image transfers (NV308A into the NV3062 surface) are taken to be on
+  libgcm's subchannels, 3 and 5; the objects bound to them are not read.
+- Reports: the local ones are in a part of local memory the game is not given
+  (`0x0FE00000`), the main-memory ones at I/O offset `0x0E000000`. A
+  `ZPASS_PIXEL_CNT` report is always `0x100000` (everything passes); the
+  other kinds write 0.
+- `cellFsGetFreeSize` reports the free space `cellGameBootCheck` does,
+  40,000,000 KB, whatever the host has.
+- The system cache relays a cache whose directory exists from an earlier
+  run, and clears any other.
+- `cellAudioOutGetSoundAvailability` answers 2 channels for linear PCM at
+  48 kHz and 0 for everything else. Audio notifications are an event to each
+  registered queue every 256 samples; their source is the queue's key.
+- `cellSysutilGetSystemParamInt` answers as a console set to English with
+  cross to confirm, in the SCEE area, with no parental limit.
 - An import with no implementation returns `CELL_OK`; an lv2 call with none
   returns `CELL_ENOSYS`. Both are reported.

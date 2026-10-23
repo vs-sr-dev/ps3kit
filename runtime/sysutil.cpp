@@ -132,3 +132,33 @@ PS3_HLE(cellSysutilGetBgmPlaybackStatus) {
     st8(p + 1, g_bgm_enable);
     c.r[3] = CELL_OK;
 }
+
+// (id, s32* value): the system settings, as a console set to English with
+// cross to confirm would answer them. Unknown ids are reported.
+PS3_HLE(cellSysutilGetSystemParamInt) {
+    uint32_t id = arg_u32(c, 0), out = arg_u32(c, 1);
+    int32_t v;
+    switch (id) {
+    case 0x0111: v = 1; break;                  // LANG: English (US)
+    case 0x0112: v = 1; break;                  // ENTER_BUTTON_ASSIGN: cross
+    case 0x0114: v = 2; break;                  // DATE_FORMAT: DDMMYYYY
+    case 0x0115: v = 1; break;                  // TIME_FORMAT: 24 hours
+    case 0x0116: v = 0; break;                  // TIMEZONE: minutes from UTC
+    case 0x0117: v = 0; break;                  // SUMMERTIME
+    case 0x0121: v = 0; break;                  // GAME_PARENTAL_LEVEL: off
+    case 0x0123: v = 2; break;                  // LICENSE_AREA: SCEE
+    case 0x0141: v = 0; break;                  // CURRENT_USER_HAS_NP_ACCOUNT
+    case 0x0151: v = 0; break;                  // CAMERA_PLFREQ
+    case 0x0152: v = 0; break;                  // PAD_RUMBLE: off
+    case 0x0153: v = 0; break;                  // KEYBOARD_TYPE
+    case 0x0154: v = 0; break;                  // JAPANESE_KEYBOARD_ENTRY_METHOD
+    case 0x0155: v = 0; break;                  // CHINESE_KEYBOARD_ENTRY_METHOD
+    case 0x0156: v = 0; break;                  // PAD_AUTOOFF
+    default:
+        rt_log("sysutil: system parameter %X asked for, not known; it answers EINVAL", id);
+        c.r[3] = 0x80010002u;
+        return;
+    }
+    st32(out, (uint32_t)v);
+    c.r[3] = CELL_OK;
+}

@@ -20,7 +20,7 @@ std::mutex g_mx;
 std::condition_variable g_cv;
 
 constexpr uint32_t CELL_EDEADLK = 0x80010008u, CELL_EPERM = 0x80010009u, CELL_EBUSY = 0x8001000Au,
-                   CELL_ETIMEDOUT = 0x8001000Bu, CELL_ENOTCONN = 0x80010010u, CELL_EISCONN = 0x8001000Fu;
+                   CELL_ETIMEDOUT = 0x8001000Bu, CELL_ENOTCONN = 0x80010016u, CELL_EISCONN = 0x80010015u;
 constexpr uint32_t kLwFree = 0xFFFFFFFFu;
 constexpr uint32_t kSyncRecursive = 0x10;
 
@@ -70,7 +70,14 @@ uint32_t lw_lock(std::unique_lock<std::mutex>& lk, uint32_t m, uint32_t me, uint
     if (owner != kLwFree) {
         if (!wait) return CELL_EBUSY;
         st32(m + 4, ld32(m + 4) + 1);
-        bool ok = wait_for(lk, timeout, [m] { return ld32(m) == kLwFree; });
+        bool ok;
+        if (!timeout && !wait_for(lk, 5000000, [m] { return ld32(m) == kLwFree; })) {
+            // a wait this long is worth naming, for whoever is looking for a deadlock
+            rt_log("sync: lwmutex %08X: thread %X has waited 5 s, thread %X holds it", m, me, ld32(m));
+            ok = wait_for(lk, 0, [m] { return ld32(m) == kLwFree; });
+        } else {
+            ok = wait_for(lk, timeout, [m] { return ld32(m) == kLwFree; });
+        }
         st32(m + 4, ld32(m + 4) - 1);
         if (!ok) return CELL_ETIMEDOUT;
     }
@@ -509,4 +516,31 @@ bool lv2_event_queue_push(uint32_t queue, uint64_t source, uint64_t d1, uint64_t
     q->events.push_back({source, d1, d2, d3});
     g_cv.notify_all();
     return true;
+}
+
+// The receiving side for the runtime's own consumers (an SPU thread's
+// sys_spu_thread_receive_event): the oldest event of a queue, waiting for
+// one when `wait`. CELL_OK, CELL_ESRCH (no such queue), CELL_EBUSY (empty and
+// not waiting), or 0x80010013 (ECANCELED: destroyed while waiting). `stop`
+// is polled while waiting; when it turns true the wait ends with CELL_EBUSY.
+uint32_t lv2_event_queue_pop(uint32_t queue, uint64_t ev[4], bool wait, const std::atomic<bool>* stop) {
+    std::unique_lock<std::mutex> lk(g_mx);
+    if (!g_equeue.get(queue)) return CELL_ESRCH;
+    auto ready = [&] { EQueue* q = g_equeue.get(queue); return !q || !q->events.empty() || (stop && *stop); };
+    if (wait) while (!g_cv.wait_for(lk, std::chrono::milliseconds(50), ready)) {}
+    EQueue* q = g_equeue.get(queue);
+    if (!q) return 0x80010013u;
+    if (q->events.empty()) return CELL_EBUSY;
+    auto e = q->events.front();
+    q->events.pop_front();
+    for (int i = 0; i < 4; ++i) ev[i] = e[i];
+    return CELL_OK;
+}
+
+// A queue of the runtime's own (a SPURS event flag's): its id.
+uint32_t lv2_event_queue_new(uint32_t size) {
+    std::lock_guard<std::mutex> lk(g_mx);
+    EQueue q;
+    if (size) q.size = size;
+    return g_equeue.add(q);
 }
